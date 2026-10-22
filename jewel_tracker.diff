@@ -1,0 +1,70 @@
+--- /root/.claude/uploads/bb57362c-e032-5c73-9207-7f4a9a0aa859/b15910a8-1791979160283_jewel_tracker.py	2026-10-14 11:59:35.554073698 +0000
++++ jewel_tracker.py	2026-10-14 12:03:46.470071327 +0000
+@@ -172,6 +172,13 @@
+ BG_DARK_V_MAX = 60
+ GOLD_MIN_FRAC = 0.30
+ GOLD_MIN_PX = 30           # fewer non-background pixels than this -> not a jewel
++# Skin passes the gold check above (hue 8-35 covers it). Measured on the 14-10 11:53 recording: the operator's
++# fingers H 10-13, S ~190 (60-99 % of their pixels match below); the jewels H 16-24, S 60-90 (0-6 % match).
++# A low-confidence detection on the fingertip beside the stone was taken for the jewel being rubbed and then
++# raised a false "J2/J3 MISSING - left the ROI".
++SKIN_H_MAX = 14            # skin: hue <= this ...
++SKIN_S_MIN = 110           # ... and strongly saturated (gold here is S 60-90)
++SKIN_MAX_FRAC = 0.35       # more skin than this among the non-background pixels -> a hand, not a jewel
+ MERGE_GAP_PX = 40          # detections whose masks come this close are pieces of one jewel
+                            # (a spread-out chain's masks miss the thin strands, leaving ~30 px gaps)
+                            # and are merged; ~1 cm at the current camera height, so keep
+@@ -467,6 +474,9 @@
+     n = int((~background).sum())
+     if n < GOLD_MIN_PX:
+         return None
++    skin = (h <= SKIN_H_MAX) & (s >= SKIN_S_MIN) & ~background
++    if float(skin.sum()) / n > SKIN_MAX_FRAC:
++        return 0.0  # the operator's fingers, not gold
+     gold = (h >= GOLD_H[0]) & (h <= GOLD_H[1]) & (s >= GOLD_S_MIN) & (v >= GOLD_V_MIN) & ~background
+     return float(gold.sum()) / n
+ 
+@@ -691,6 +701,11 @@
+         box = find_stone_cv(frame, self.roi_fn())
+         if box is None and self.model is not None and self.fails % STONE_MODEL_EVERY == 0:
+             box = self.model_box(frame)
++        if box is not None and self.bbox is not None and self.present and box_iou(box, self.bbox) > 0.3:
++            area = (box[2] - box[0]) * (box[3] - box[1])
++            old = (self.bbox[2] - self.bbox[0]) * (self.bbox[3] - self.bbox[1])
++            if area < 0.8 * old:
++                box = self.bbox  # part of the stone hidden by the hand (14-10 42-48 s): keep the whole stone
+         if box is not None:
+             self.bbox, self.found_t, self.fails = box, time.time(), 0
+         else:
+@@ -1555,7 +1570,7 @@
+         the hand) moves and ends the bridge. Not on the stone: there the jewel is in the hand."""
+         tr.bridged = False
+         if (t - tr.det_seen > CSRT_MAX_GAP_S or tr.state in ("LEFT_ROI", "MISSING")
+-                or self.on_stone(tr.pos, margin=0)):
++                or self.on_stone(tr.pos)):  # on or beside the stone: CSRT would follow the fingers
+             tr.csrt = None
+             return False
+         x1, y1, x2, y2 = (int(v) for v in tr.det_box)
+@@ -1606,8 +1621,10 @@
+ 
+     def stone_det_ok(self, tr, d):
+         """Rub marks on the touchstone look like gold to the detector, so a detection on the stone only
+-        counts as this jewel if its fingerprint (with SigLIP2 when available) matches the jewel's."""
+-        if not self.on_stone(d.c, margin=0):
++        counts as this jewel if its fingerprint (with SigLIP2 when available) matches the jewel's.
++        The same goes for the band just around the stone (STONE_MARGIN_PX): the fingers holding a jewel being
++        rubbed are there (14-10: a fingertip right of the stone was taken for J2, then J3)."""
++        if not self.on_stone(d.c, margin=STONE_MARGIN_PX):
+             return True
+         frame = getattr(self, "cur_frame", None)
+         if tr.app is None or frame is None:
+@@ -1824,6 +1841,9 @@
+                 new = old  # latched until the jewel is seen inside the ROI again
+             elif t - tr.rub_last <= RUB_GRACE_S:
+                 new = "RUBBING"  # in the hand on the stone: no alert
++            elif self.on_stone(tr.pos) and lost > 0.3:
++                new = "OCCLUDED"  # last seen on / beside the stone = in the operator's hand there, even when the
++                                  # stone lies near the ROI edge; not "left the ROI"
+             elif d < EDGE_MARGIN_PX and lost > EDGE_GRACE_S and not self.still_there(tr):
+                 new = "LEFT_ROI"
+             elif lost > 0.3:

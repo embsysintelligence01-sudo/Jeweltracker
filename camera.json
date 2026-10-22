@@ -1,0 +1,32 @@
+{
+  "mode": "usb",
+  "usb": {
+    "index": 0,
+    "resolution": "2560x1440",
+    "antiflicker": {
+      "enabled": true,
+      "mains_hz": 50,
+      "shutter_denom": 50,
+      "brightness": 96,
+      "gain": 0
+    }
+  },
+  "network": {
+    "ip": "192.168.29.214",
+    "user": "admin",
+    "password": "admin123",
+    "channel": 1,
+    "subtype": 0,
+    "antiflicker": "50 Hz"
+  },
+  "direct": {
+    "ip": "192.168.29.215",
+    "user": "admin",
+    "password": "admin@04",
+    "channel": 1,
+    "subtype": 0
+  },
+  "custom": {
+    "url": "0"
+  }
+}

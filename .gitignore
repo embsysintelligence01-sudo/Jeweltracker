@@ -1,0 +1,76 @@
+.venv/
+__pycache__/
+acid_test/captures/
+acid_test/dataset/
+acid_test/evaluation/
+
+# AI / ML model weights
+*.onnx
+*.pt
+*.pth
+*.hef
+*.keras
+*.h5
+*.safetensors
+*.tflite
+*.engine
+*.ckpt
+*.pb
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.pkg
+*.pyz
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local artifacts and datasets
+runs/
+wandb/
+*.log
+
+# AI models
+*.onnx
+*.pt
+*.pth
+*.hef
+*.keras
+*.h5
+*.safetensors
+*.tflite
+*.engine
+*.ckpt
+*.pb
+
+# Generated builds
+build/
+dist/
+*.exe
+*.pkg
+*.pyz
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime captures and diagnostics
+captures/
+diagnostics/
+*.log
+
+# Temporary backups
+*.bak
+
+# Training outputs
+runs/
+wandb/

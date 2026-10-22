@@ -1,0 +1,166 @@
+{
+  "groups": {
+    "gold_verification": [
+      "a piece of real gold jewelry on a white background, yellow gold color",
+      "a gold ornament made of yellow gold metal, clearly gold colored",
+      "a traditional gold jewelry item with visible yellow gold finish",
+      "a studio photo of a gold jewelry piece, golden yellow in color"
+    ],
+    "non_gold_metal": [
+      "a piece of silver jewelry on a white background, white gray metallic color",
+      "a silver colored metal jewelry item, not yellow gold",
+      "a white metal or platinum colored ornament",
+      "a jewelry piece made of non-gold metal like silver or white gold",
+      "a copper or bronze colored jewelry item without yellow gold"
+    ],
+    "wrist": [
+      "a studio product photo of wrist jewelry",
+      "a gold wrist ornament on a white background",
+      "a jewelry item meant for the wrist, laid flat",
+      "a bracelet or bangle product photo on a white tabletop"
+    ],
+    "neck": [
+      "one complete gold neck jewelry item with a long continuous chain or strand",
+      "a gold necklace folded or tightly coiled to fit a small weighing tray",
+      "a tangled necklace with overlapping loops and a central pendant",
+      "a traditional neck ornament that is not a matched pair of ear-to-hair side chains"
+    ],
+    "ear": [
+      "a studio product photo of earrings or a nosepin",
+      "one or two small ear ornaments on a white background",
+      "a tiny gold nose stud, nosepin, or nose ring",
+      "a dangling, stud, or jhumka earring without an ear-to-hair support chain"
+    ],
+    "ear_hair": [
+      "a matched pair of narrow ear-to-hair support chains shown side by side",
+      "two traditional mattal side pieces with hooks or loops at both ends",
+      "a repeated row of small dangling motifs on an ear chain accessory",
+      "a bridal mattal pair without a necklace pendant or closed neck loop"
+    ],
+    "finger": [
+      "a studio product photo of finger jewelry",
+      "a ring sized for a finger on a white background",
+      "a circular finger ornament laid flat on a table",
+      "a small jewelry band worn on the finger",
+      "a small C-shaped adjustable finger ring with an open gap and rounded ends",
+      "an ornate finger ring photographed from the side with the band partly hidden",
+      "a V-shaped or chevron finger ring viewed from the decorative front"
+    ],
+    "negative": [
+      "a non-jewelry item",
+      "a person wearing casual clothes",
+      "a landscape or scenery",
+      "a group of people",
+      "a building or structure",
+      "a vehicle or car",
+      "a piece of furniture",
+      "a book or document",
+      "a household item",
+      "a toy or recreational item",
+      "a food item",
+      "an animal",
+      "a electronic device",
+      "a tool or implement",
+      "a piece of clothing",
+      "a non-jewelry accessory"
+    ]
+  },
+  "classes": {
+    "Bracelet": {
+      "group": "wrist",
+      "prompts": [
+        "a studio product photo of a gold bracelet",
+        "a flexible chain bracelet for the wrist with a clasp",
+        "a linked wrist bracelet jewelry item",
+        "a short gold wrist ornament with links or charms",
+        "a chain style or cuff style bracelet",
+        "a delicate wrist bracelet that drapes slightly",
+        "a bracelet that is meant for the wrist and is not a rigid closed bangle",
+        "a plain gold bracelet product photo"
+      ]
+    },
+    "Bangle": {
+      "group": "wrist",
+      "prompts": [
+        "a studio product photo of a gold bangle",
+        "a rigid circular wrist bangle with no hanging chain",
+        "a stiff bracelet in a closed round loop",
+        "a traditional kada or slip-on bangle for the wrist",
+        "a solid metal wrist bangle laid flat on a white background",
+        "a hinged or closed circular bangle bracelet",
+        "a rigid gold wrist ornament with a uniform band shape",
+        "a stackable plain or stone-set bangle product photo"
+      ]
+    },
+    "Chain / Necklace": {
+      "group": "neck",
+      "prompts": [
+        "a studio product photo of gold neck jewellery laid flat on a white background",
+        "a gold chain or necklace arranged within a small tabletop area",
+        "a long gold necklace tightly folded into a compact bundle on a small scale",
+        "a coiled neck chain whose overlapping strands may look like several short chains",
+        "a tangled necklace with a large central pendant and the long chain wrapped around it",
+        "a broad choker necklace with many pearls, stones, or repeated hanging decorations",
+        "one continuous neckpiece with clasp or tie ends, not a matched mattal pair",
+        "a plain linked gold neck chain with or without a pendant",
+        "a decorative traditional gold necklace with patterned front elements",
+        "a gold necklace with a prominent central dollar or temple pendant",
+        "a south indian dollar chain laid flat on a white background",
+        "a long traditional haram necklace folded or coiled to fit a small test bed",
+        "a bridal or temple jewellery haram with a long drop or pendant",
+        "a kasu mala or kasumalai made from repeated gold coin motifs",
+        "a traditional gold coin necklace with overlapping round elements",
+        "a gold mangalsutra or thali chain with a central wedding pendant",
+        "necklace-type gold jewellery including chain, necklace, haram, kasu mala, dollar chain, or mangalsutra"
+      ]
+    },
+    "Mattal": {
+      "group": "ear_hair",
+      "prompts": [
+        "a studio product photo of a mattal ear chain",
+        "a south indian mattal that connects the earring to the hair",
+        "a bridal ear chain accessory attached from ear to hair",
+        "a pair of temple jewelry mattal side chains",
+        "two matching horizontal mattal ornaments, each with a support chain and end hooks",
+        "a matched left and right pair of ear-to-hair chains with repeated dangling motifs",
+        "a short side-head accessory pair without a large central necklace pendant",
+        "a bharatanatyam ear chain or mattal product photo",
+        "a gold ear to hair chain accessory on a white background",
+        "a decorative chain that supports earrings from the hair",
+        "a traditional mattal jewelry piece for the side of the head"
+      ]
+    },
+    "Earrings / Nosepin": {
+      "group": "ear",
+      "prompts": [
+        "a studio product photo of earrings",
+        "a pair of matching ear ornaments laid flat on a white background",
+        "a pair of gold earrings with posts, hooks, or drop attachments",
+        "a pair of jhumka or jhumki earrings with a bell shaped hanging dome",
+        "a jimikki style earring pair product photo",
+        "a dangling earring pair without any side chain connecting to the hair",
+        "a bell shaped or drop style ear ornament set",
+        "a pair of earrings whose main form hangs from the ear and is not a mattal"
+        ,"a single tiny gold nosepin or nose stud with a decorative stone"
+        ,"a small nose ring or nose ornament grouped with earrings"
+      ]
+    },
+    "Finger Ring": {
+      "group": "finger",
+      "prompts": [
+        "a studio product photo of a finger ring",
+        "a small circular ring band sized for a finger",
+        "a gold finger ring laid flat on a white background",
+        "a ring with a circular hoop and a decorative top setting",
+        "a solitaire, floral, or stone set ring for the finger",
+        "a single jewelry ring with bezel and band",
+        "a small closed loop ornament worn on the finger",
+        "a finger ring product photo that is much smaller than a bangle",
+        "a small adjustable open-ended gold finger ring shaped like a C with two rounded tips",
+        "an open finger ring whose narrow circular band has a visible gap",
+        "a decorative cocktail ring seen from the side so its crown hides part of the finger band",
+        "a V-shaped or chevron gold finger ring shown from the ornate front"
+      ]
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-21",
+  "method": "Actual model, saved 2560x1440 frame replayed at 20 FPS, forced stone-motion workload, offscreen GUI; no physical accuracy labels. Before/after ran separately.",
+  "before": {
+    "mode": "before",
+    "rows": [
+      {
+        "phase": "idle",
+        "bench_fps": 9.5,
+        "stone_fps": 0.0,
+        "preview_fps": 9.5,
+        "preview_age_mean_ms": 127.2,
+        "preview_age_p95_ms": 205.8,
+        "max_bench_gap_ms": 253.2
+      },
+      {
+        "phase": "active",
+        "bench_fps": 8.0,
+        "stone_fps": 7.83,
+        "preview_fps": 8.0,
+        "preview_age_mean_ms": 152.6,
+        "preview_age_p95_ms": 180.1,
+        "max_bench_gap_ms": 157.1
+      },
+      {
+        "phase": "recovered",
+        "bench_fps": 12.0,
+        "stone_fps": 0.25,
+        "preview_fps": 12.0,
+        "preview_age_mean_ms": 117.8,
+        "preview_age_p95_ms": 151.9,
+        "max_bench_gap_ms": 147.5
+      }
+    ],
+    "peak_rss_mib": 1379.2
+  },
+  "after": {
+    "mode": "after",
+    "rows": [
+      {
+        "phase": "idle",
+        "bench_fps": 10.75,
+        "stone_fps": 0.0,
+        "preview_fps": 19.75,
+        "preview_age_mean_ms": 29.4,
+        "preview_age_p95_ms": 45.8,
+        "max_bench_gap_ms": 193.5
+      },
+      {
+        "phase": "active",
+        "bench_fps": 7.67,
+        "stone_fps": 7.5,
+        "preview_fps": 20.0,
+        "preview_age_mean_ms": 31.2,
+        "preview_age_p95_ms": 49.5,
+        "max_bench_gap_ms": 190.3
+      },
+      {
+        "phase": "recovered",
+        "bench_fps": 11.75,
+        "stone_fps": 0.5,
+        "preview_fps": 20.25,
+        "preview_age_mean_ms": 28.9,
+        "preview_age_p95_ms": 45.0,
+        "max_bench_gap_ms": 123.3
+      }
+    ],
+    "peak_rss_mib": 1464.6
+  }
+}

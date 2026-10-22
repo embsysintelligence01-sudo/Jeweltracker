@@ -1,0 +1,16 @@
+{
+  "description": "Development-only session curation. Original manifests are never modified.",
+  "invalid_overrides": {
+    "20260912_134450_006554_f8954c62": "baseline streak too weak for a reliable temporal comparison",
+    "20260912_153458_306276_6ac5139d": "baseline streak too weak for a reliable temporal comparison",
+    "20260912_154255_892638_6cb58fd1": "no reliably visible baseline streak",
+    "20260912_163059_123175_688a2503": "borderline weak baseline streak",
+    "20260912_163122_668012_96689175": "acid or liquid already present during baseline",
+    "20260912_163142_183930_7c2e2bcf": "acid or liquid already present during baseline",
+    "20260912_163248_752992_f6b6c159": "large stone or camera movement during the reaction",
+    "20260912_163711_012568_b3f51d09": "reflective acid or glare already present during baseline",
+    "20260912_163845_165652_92dd2d6f": "baseline streak too weak for a reliable temporal comparison",
+    "20260912_163919_767976_e571abf2": "baseline streak too weak for a reliable temporal comparison",
+    "20260912_164138_925048_d36da8ab": "acid or liquid already present during baseline"
+  }
+}

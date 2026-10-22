@@ -1,0 +1,13 @@
+# Install torch/torchvision CPU wheels first; see README-linux.md.
+torch
+torchvision
+ultralytics
+opencv-python
+PyQt5
+# The copied standalone acid_test/app.py uses Qt6 in its own process.
+PyQt6
+scipy
+numpy
+onnxruntime
+Pillow
+onnx
