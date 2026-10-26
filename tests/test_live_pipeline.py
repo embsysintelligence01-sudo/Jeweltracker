@@ -82,6 +82,20 @@ class PreviewTests(unittest.TestCase):
         preview.clear()
         np.testing.assert_array_equal(preview.render(fresh.copy(), 10.1), fresh)
 
+    def test_worker_overlay_survives_slow_inference_until_observation_expires(self):
+        with patch.object(tracker, 'JewelIdModel', return_value=None):
+            worker = tracker.Worker(0, [(0, 0), (9, 0), (9, 9)])
+        self.assertEqual(tracker.LIVE_RESULT_MAX_AGE_S, worker.preview.max_age)
+        overlay = np.zeros((10, 10, 3), np.uint8)
+        overlay[1, 1] = (0, 255, 0)
+        worker.preview.publish(overlay, 10.)
+        frame = np.full_like(overlay, 70)
+        # 200 ms inference plus the next 200 ms observation gap remains visible.
+        np.testing.assert_array_equal(worker.preview.render(frame.copy(), 10.4)[1, 1], (0, 255, 0))
+        np.testing.assert_array_equal(worker.preview.render(frame.copy(), 10.51), frame)
+        worker.arm()
+        np.testing.assert_array_equal(worker.preview.render(frame.copy(), 10.41), frame)
+
     def test_gui_preview_does_not_wait_for_tracking_or_model_locks(self):
         with patch.object(tracker.QtCore.QTimer, 'singleShot'), patch.object(tracker, 'write_log'):
             window = tracker.MainWindow()
@@ -218,10 +232,10 @@ class WorkerPipelineTests(unittest.TestCase):
                 stone.is_alive.return_value = rubber.is_alive.return_value = False
                 worker.detect = Mock(side_effect=detect)
                 worker.update_tracks, worker.try_lock = Mock(), Mock()
-                with patch.object(tracker, 'SharedGoldModel'), patch.object(tracker, 'YOLO'), \
+                with patch.object(tracker, 'SharedGoldModel'), patch.object(tracker, 'StoneOnnxModel'), \
                      patch.object(tracker, 'RTSPGrabber', return_value=grabber), \
                      patch.object(tracker, 'StoneWatcher', return_value=stone), \
-                     patch.object(tracker, 'RubbingWatcher', return_value=rubber), \
+                     patch.object(tracker, 'RubbingObserver', return_value=rubber), \
                      patch.object(tracker.time, 'time', side_effect=lambda: clock[0]):
                     worker.run()
                 worker.detect.assert_called_once()
@@ -259,10 +273,10 @@ class WorkerPipelineTests(unittest.TestCase):
         worker.mode = 'LOCKED'
         worker.update_tracks = Mock()
         worker.draw = lambda image, *args: image
-        with patch.object(tracker, 'SharedGoldModel'), patch.object(tracker, 'YOLO'), \
+        with patch.object(tracker, 'SharedGoldModel'), patch.object(tracker, 'StoneOnnxModel'), \
              patch.object(tracker, 'RTSPGrabber', return_value=grabber), \
              patch.object(tracker, 'StoneWatcher', return_value=stone), \
-             patch.object(tracker, 'RubbingWatcher', return_value=rubber), \
+             patch.object(tracker, 'RubbingObserver', return_value=rubber), \
              patch.object(tracker.time, 'time', side_effect=lambda: clock[0]), \
              patch.object(tracker.time, 'monotonic', side_effect=lambda: clock[0]):
             worker.run()
@@ -271,32 +285,8 @@ class WorkerPipelineTests(unittest.TestCase):
         # Only completed bench observations reach the guarding state machine.
         self.assertLessEqual(worker.update_tracks.call_count, jobs.count('bench'))
         self.assertGreaterEqual(worker.update_tracks.call_count, jobs.count('bench') - 1)
-        rubber.start.assert_called_once()
+        self.assertGreater(rubber.observe.call_count, 0)
 
-    def test_stale_stone_prediction_is_not_credited_as_rubbing(self):
-        model = Mock()
-        watcher = tracker.RubbingWatcher(Mock(), model, lambda: (0, 0, 100, 100))
-        watcher.active = True
-        watcher.stone_still = Mock(return_value=False)
-        watcher.judge = Mock()
-        with patch.object(tracker, 'rubbing_evidence', return_value={'c': np.array([10, 10])}):
-            watcher.step(np.zeros((100, 100, 3), np.uint8), time.time() - 1)
-        watcher.judge.assert_not_called()
-        self.assertFalse(watcher.snapshot()[1])
-
-    def test_reset_during_stone_prediction_cannot_credit_the_next_batch(self):
-        generation = [0]
-        watcher = tracker.RubbingWatcher(Mock(), Mock(), lambda: (0, 0, 100, 100),
-                                        generation_fn=lambda: generation[0])
-        watcher.active = True
-        watcher.stone_still = Mock(return_value=False)
-        watcher.judge = Mock()
-        def evidence(*args, **kwargs):
-            generation[0] += 1
-            return {'c': np.array([10, 10])}
-        with patch.object(tracker, 'rubbing_evidence', side_effect=evidence):
-            watcher.step(np.zeros((100, 100, 3), np.uint8), time.time())
-        watcher.judge.assert_not_called()
 
 
 if __name__ == '__main__':

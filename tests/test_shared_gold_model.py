@@ -39,21 +39,21 @@ class SharedGoldTests(unittest.TestCase):
         with patch.object(tracker,'JewelIdModel'):
             worker=tracker.Worker(0,[(0,0),(100,0),(100,100)])
         with patch.object(tracker,'SharedGoldModel') as shared, \
-             patch.object(tracker,'YOLO') as yolo, \
+             patch.object(tracker,'StoneOnnxModel') as stone_model, \
              patch.object(tracker,'RTSPGrabber') as grabber, \
              patch.object(tracker,'StoneWatcher') as stone, \
-             patch.object(tracker,'RubbingWatcher') as rubbing:
+             patch.object(tracker,'RubbingObserver') as rubbing:
             grabber.return_value.start.side_effect=lambda:setattr(worker,'running',False)
             for watcher in (grabber,stone,rubbing):watcher.return_value.is_alive.return_value=False
             worker.run()
             shared.assert_called_once_with(tracker.MODEL_PATH)
-            yolo.assert_called_once_with(tracker.STONE_MODEL_PATH,task='segment')
+            stone_model.assert_called_once_with(tracker.STONE_MODEL_PATH)
             self.assertIs(worker.model,shared.return_value)
-            self.assertIs(rubbing.call_args.args[1],worker.model)
+            self.assertEqual(worker.stone_box,rubbing.call_args.args[0])
             self.assertEqual(tracker.MODEL_PATH,tracker.RUB_GOLD_MODEL_PATH)
             self.assertEqual('rojeweltrack.onnx',Path(tracker.MODEL_PATH).name)
 
-    def test_real_model_supports_bench_and_stone_crop_paths(self):
+    def test_real_full_frame_model_output_is_reused_for_stone_masking(self):
         model=tracker.SharedGoldModel()
         self.addCleanup(model.close)
         path=next((Path(tracker.SCRIPT_DIR)/'captures').glob('*_capture.jpg'))
@@ -62,10 +62,11 @@ class SharedGoldTests(unittest.TestCase):
         self.assertIsNotNone(result.boxes)
         self.assertEqual({0:'gold'},result.names)
         self.assertEqual([320,320],model.backend.predictor.imgsz)
-        stone=tracker.find_stone_cv(frame,tracker.to_poly([(0,0),(frame.shape[1]-1,0),(frame.shape[1]-1,frame.shape[0]-1),(0,frame.shape[0]-1)]))
-        if stone is None:
-            h,w=frame.shape[:2];stone=(w//3,h//3,2*w//3,2*h//3)
-        evidence=tracker.rubbing_evidence(model,frame,stone)
+        stone_model=tracker.StoneOnnxModel(tracker.STONE_MODEL_PATH)
+        stone=tracker.StoneWatcher(None,stone_model,lambda:None).model_box(frame)
+        self.assertIsNotNone(stone)
+        self.assertEqual({0:'St'},stone_model.names)
+        evidence=tracker.rubbing_evidence(result.masks.xy if result.masks is not None else [],result.boxes.conf.cpu().numpy(),frame.shape,stone)
         if evidence is not None:
             self.assertEqual(2,len(evidence['c']))
             self.assertGreater(evidence['mask'].sum(),0)

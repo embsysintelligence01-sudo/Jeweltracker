@@ -29,11 +29,12 @@ the same camera concurrently.
 
 ## Model reuse and acid preview
 
-The tracker window owns one `AcidModelCache`. Models load and warm up with
-synthetic frames on the first Start acid test click after rubbing is confirmed.
+The tracker window owns one `AcidModelCache`. The OpenVINO pH-paper model loads and warms up on the first Start acid test
+click after rubbing is confirmed. The temporal acid models load only after
+the pH reaction is verified.
 Later jewels, retries, resets, and camera reconnects in the same window reuse
-those sessions. There is no background acid prediction while idle or rubbing:
-live acid detection runs only in WAIT_FOR_ACID, and the temporal classifier
+those model sessions, but each attempt starts a new pH-paper verification. There is no background acid prediction while idle or rubbing:
+pH inference runs only during the pH check, live acid detection runs only in WAIT_FOR_ACID, and the temporal classifier
 runs once after observation. CPU sessions use two threads each with idle
 spinning disabled. Restart the tracker to load newly replaced/retrained models.
 
@@ -53,7 +54,8 @@ for per-sequence results and model selection checks. This checks integration
 and prediction parity; it is not an independent accuracy or physical acid
 test. The training report marks this model as a development candidate.
 
-The **Acid crop** column shows the detected acid box during observation,
+The **pH / Acid crop** column first shows the detected pH paper, then the
+detected acid box during observation,
 updated only for its assigned jewel. Its last image remains next to the result;
 the full-resolution crop is saved as `acid_preview.png` with the sequence.
 Token checks reject previews from cancelled tests or old batches. Thumbnails
@@ -62,20 +64,43 @@ are bounded to 224 pixels and update one cell without rebuilding the table.
 ## Operator sequence
 
 1. Prepare a clean, dry stone or fresh reaction area. Place jewels/stone and
-   let the existing tracker assign identities.
-2. Rub any untested jewel. The existing segmented gold-centroid movement
+   let the existing tracker assign identities. Keep hands clear while the
+   automatic before-rubbing reference analyzes old marks and recommends a blue
+   target in the Z1–Z4 preview. Use **Capture / retake rubbing reference** if
+   requested; clean the stone when no usable clear space remains.
+2. Wait for reference guidance, then rub any untested jewel. The existing segmented gold-centroid movement
    logic assigns rubbing to that jewel; numeric order is unrestricted.
 3. When Jn is confirmed RUBBED, further rubbing credit is paused. Remove the
    jewel and hands and press **Start acid test for Jn**. Select the observation
    duration and optionally enter the acid grade/batch before pressing Start.
-4. Wait through the two-second baseline. Apply acid only at **NOW APPLY ACID**.
-   Detection must repeat three times at IoU >= 0.45, confidence >= 0.60, inside
-   the stone and the selected jewel's padded rubbing region. Acid elsewhere
-   on the stone is ignored.
-5. Keep the stone/camera still during observation (5 seconds by default).
+   This first compares an after photo with the before reference. Only a confirmed
+   new mark enables acid verification; **RETAKE** keeps the old reference for retry.
+   The confirmed new mark, including one outside the recommended zone, becomes
+   this jewel's saved acid ROI. Old marks and the whole grid cell are excluded.
+4. With **pH verification ON**, show unused yellow pH paper in the existing camera view. OpenVINO OBB
+   detects the strip; the supplied color SOP requires 8 fresh-yellow detections,
+   then 2 sustained pink-reaction detections on the same strip. Add acid to
+   the paper while keeping it visible. Pre-colored paper, obscured paper and
+   a missing strip cannot complete this check. Repeat for every jewel and retry.
+   The check verifies an indicator reaction; it does not identify the reagent.
+   With pH OFF this stage is skipped and recorded as `SKIPPED_BY_OPERATOR`.
+   Hiding the stone during the pH stage does not restart verification.
+5. After **pH reaction verified**, the test pauses. Remove paper/hands, then
+   click **Ready for stone test**. Only this click starts the two-second stone
+   baseline, after relocating the saved new-rub mask onto the current stone.
+   Unclear alignment or a hidden stone waits for a new Ready click while
+   preserving pH progress. Apply acid over the magenta mark at **NOW APPLY ACID**;
+   the liquid may spread beyond the mark. Detection must repeat three times
+   at IoU >= 0.45 and confidence >= 0.60, with its centre inside the stone.
+   The detected acid box must overlap at least 50% of the smaller box/mask
+   area. Its centre can be outside the new-rub mask and padded streak area:
+   a larger acid box covering the new mark is accepted. Acid elsewhere
+   without sufficient overlap is ignored and the prompt asks for the correct
+   location. This check uses the detector box, not a segmented liquid outline.
+6. Keep the stone/camera still during observation (5 seconds by default).
    The table receives **22K GOLD**, **NON-GOLD**, or **INCONCLUSIVE** plus
-   confidence. Any next untested jewel may then be rubbed.
-6. The existing DONE behavior additionally waits for the jewel to rest off
+   confidence. Wait for the next before-reference guidance before rubbing another jewel.
+7. The existing DONE behavior additionally waits for the jewel to rest off
    the stone. DONE means the process finished, including an inconclusive
    classification; it does not mean that the material was classified gold.
 
@@ -93,14 +118,21 @@ Cancel or a camera/detection error keeps the same rubbed jewel selected for
 retry. Prepare its streak appropriately before retrying. Stone movement or
 camera resolution changes fail the capture. Reset or camera disconnect
 cancels a running test; unique batch/test tokens reject late results. A new
-batch must establish rubbing again. There is a 120-second acid-detection
-wait timeout and a three-second camera-frame timeout.
+batch must establish rubbing again. There are separate 120-second pH-verification and acid-detection
+wait timeouts and a three-second camera-frame timeout. No temporal baseline,
+stone acid detection, or classification starts before the pH check passes
+and the operator clicks **Ready for stone test**. There is no operator deadline
+for this pause; camera freshness, resolution, and stone position remain guarded.
+Cancel/reset/reconnect discards the confirmation, so every retry and jewel must
+pass pH verification and receive its own readiness click.
 
 ## Saved captures and future training
 
 `captures/<batch>_Jn_<test>/manifest.json` stores the jewel identity, acid
 metadata, model/detector hashes, detector/reaction geometry, probabilities,
-and capture timing. The three subfolders contain lossless cropped frames.
+and capture timing. `ph_verification` records the indicator result, model/weight
+hashes, color metrics, and paths to `ph_baseline.png`, `ph_reaction.png`, and
+`ph_reaction_mask.png`. The three subfolders contain lossless cropped frames.
 Captures are committed as one directory only after saving succeeds.
 
 These records use `jewel_acid_prediction_v1` with `actual_label: null`.

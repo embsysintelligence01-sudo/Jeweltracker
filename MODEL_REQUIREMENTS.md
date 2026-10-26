@@ -11,6 +11,8 @@ Model weights are stored locally and excluded from GitHub.
 | rubbing_gold.onnx | Custom ONNX model |
 | acid.onnx | Custom ONNX model |
 | rojeweltrack.onnx | Custom ONNX model |
+| new_rub_detection/models/newstone1.onnx | Stone mask/corners for before/after rubbing snapshots |
+| new_rub_detection/models/rubbedmask.onnx | Existing and newly created rubbing marks; snapshot inference |
 | nivagar_gold_v3.onnx | Custom ONNX model |
 | nivagar_gold_v3.pt | Custom PyTorch model |
 | acid_test/model_training/artifacts/temporal_mobilenet_v3_20260912_170149.pt | Temporal MobileNetV3 |

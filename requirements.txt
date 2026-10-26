@@ -9,5 +9,6 @@ PyQt6
 scipy
 numpy
 onnxruntime
+openvino==2026.4.1
 Pillow
 onnx

@@ -1,0 +1,6 @@
+Python 3.10.12
+Platform Linux-6.8.0-138-generic-x86_64-with-glibc2.35
+numpy==2.2.6
+opencv-python==5.0.0.93
+PyQt6==6.11.0
+onnxruntime==1.23.2

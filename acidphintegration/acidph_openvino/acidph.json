@@ -1,0 +1,8 @@
+{
+  "precision": "FP16",
+  "names": [
+    "acidph"
+  ],
+  "task": "obb",
+  "source": "models\\onnx\\acidph.onnx"
+}
