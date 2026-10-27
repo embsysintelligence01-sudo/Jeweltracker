@@ -1,6 +1,6 @@
 """Stateful before/after comparison for any host GUI, camera, or web framework.
 
-This adapter uses the copied core functions and the same thresholds as App.py.
+This adapter compares new marks against a saved reference without recommending zones.
 It accepts full-frame masks and corners so the host can choose its inference and
 capture lifecycle. It does not open a camera, start a GUI, or write any files.
 """
@@ -10,8 +10,8 @@ import numpy as np
 
 from .core import (marked_photo, merged_mark_regions, new_mark_locations,
                    new_mark_regions, stone_region)
-from .geometry import DEST, SIZE, align_to_reference, normalize, project_mask
-from .rubbing_zones import analyze_zones, draw_recommendation, rubbing_instruction, rubbing_result
+from .geometry import SIZE, align_to_reference, normalize, project_mask
+from .rubbing_zones import analyze_zones
 
 
 class RubCheck:
@@ -22,7 +22,6 @@ class RubCheck:
 
     def reset(self):
         self.reference = self.reference_region = self.old_mask = None
-        self.recommendation = None
 
     @staticmethod
     def _validate(frame, stone_mask, rubbed_mask, quad):
@@ -37,30 +36,31 @@ class RubCheck:
         return quad, bbox
 
     def before(self, frame, stone_mask, rubbed_mask, quad):
-        """Save the reference and return READY, CLEAN_THE_STONE, or a validation error."""
+        """Require usable clear space, without recommending a rubbing zone."""
         self.reset()
         quad, bbox = self._validate(frame, stone_mask, rubbed_mask, quad)
         reference, transform = normalize(frame, quad)
         inner = stone_region(stone_mask, transform)
         old = cv2.warpPerspective(rubbed_mask, transform, (SIZE, SIZE), flags=cv2.INTER_NEAREST)
         old, count, coverage = merged_mark_regions(old, inner)
-        zones, selected = analyze_zones(old, inner)
-        photo = marked_photo(frame, bbox, quad, None, rubbed_mask, stone_mask)
-        preview = marked_photo(reference, (0, 0, SIZE - 1, SIZE - 1), DEST,
-                               None, old, inner.astype(np.uint8) * 255)
-        if selected is not None:
+        if np.count_nonzero(inner) < 80:
+            raise ValueError("RETAKE - expose the stone surface before capturing a reference")
+        # Reuse the original clearance check, but never expose or draw its target.
+        _, clear_space = analyze_zones(old, inner)
+        ready = clear_space is not None
+        if ready:
             self.reference = reference.copy()
             self.reference_region = inner.astype(np.uint8) * 255
             self.old_mask = old.copy()
-            self.recommendation = selected
-            draw_recommendation(photo, selected, transform)
-            draw_recommendation(preview, selected)
-        return {"status": "READY" if selected else "CLEAN_THE_STONE",
-                "message": rubbing_instruction(zones, selected), "zones": zones,
-                "recommendation": selected, "photo": photo, "preview": preview,
+        photo = marked_photo(frame, bbox, quad, None, rubbed_mask, stone_mask, show_grid=False)
+        return {"status": "READY" if ready else "CLEAN_THE_STONE",
+                "message": ("Reference captured. Rub a jewel on the stone, then remove hands and jewellery before checking."
+                            if ready else "CLEAN THE STONE - not enough clear space for a new rub. Clean the stone, then capture a new reference."),
+                "photo": photo, "preview": reference.copy(), "preview_old_mask": old.copy(),
                 "old_mask": old, "old_mark_count": count, "coverage": coverage}
 
-    def after(self, frame, stone_mask, rubbed_mask, quad):
+    def after(self, frame, stone_mask, rubbed_mask, quad, *, frame_to_reference=None,
+              alignment_detail=None):
         """Return NEW_RUB or RETAKE, with reference/frame locations only on success."""
         result = {"status": "RETAKE", "message": "Capture a valid before photo first.",
                   "new_mask": None, "locations": [], "photo": None, "preview": None}
@@ -69,25 +69,35 @@ class RubCheck:
         quad, bbox = self._validate(frame, stone_mask, rubbed_mask, quad)
         result["photo"] = marked_photo(frame, bbox, quad, None, rubbed_mask, stone_mask,
                                        show_grid=False)
-        aligned, transform, detail = align_to_reference(
-            frame, quad, self.reference, self.reference_region, stone_mask)
+        if frame_to_reference is None:
+            aligned, transform, detail = align_to_reference(
+                frame, quad, self.reference, self.reference_region, stone_mask)
+        else:
+            transform = np.asarray(frame_to_reference, float)
+            if transform.shape != (3, 3) or not np.isfinite(transform).all() or abs(np.linalg.det(transform)) < 1e-9:
+                raise ValueError('RETAKE - invalid marker alignment')
+            aligned = cv2.warpPerspective(frame, transform, (SIZE, SIZE))
+            detail = alignment_detail or 'aligned (marker snapshot)'
         result["alignment"] = detail
         if aligned is None:
-            result["message"] = f"RETAKE - {detail}; no rubbing zone confirmed."
+            result["message"] = f"RETAKE - {detail}; no new rub confirmed."
             return result
         inner = stone_region(stone_mask, transform)
         marks = cv2.warpPerspective(rubbed_mask, transform, (SIZE, SIZE), flags=cv2.INTER_NEAREST)
-        new = new_mark_regions(marks, self.old_mask, inner)
+        new = new_mark_regions(marks, self.old_mask, inner, reject_old_overlap=True)
         change = cv2.absdiff(aligned, self.reference).mean(axis=2)
         new[change < 12] = 0
         new, count, fraction = merged_mark_regions(new, inner)
-        reference_quad = cv2.perspectiveTransform(DEST[None], np.linalg.inv(transform))[0]
         photo = marked_photo(frame, bbox, quad, None, rubbed_mask, stone_mask,
-                             grid_quad=reference_quad)
+                             show_grid=False)
         result.update(photo=photo, preview=new, new_mark_count=count, coverage=fraction,
+                      preview_old_mask=np.where(inner, self.old_mask, 0).astype(np.uint8),
                       frame_to_reference=transform.copy())
-        if not 0.001 <= fraction <= 0.15:
-            result["message"] = "RETAKE - new rubbing unclear; no rubbing zone confirmed."
+        if fraction < 0.001:
+            result["message"] = "RETAKE - No new rub detected. Please rub on a clear area and retry."
+            return result
+        if fraction > 0.15:
+            result["message"] = "RETAKE - new rubbing unclear; too much of the stone has changed."
             return result
         locations = new_mark_locations(new, transform)
         projected = project_mask(new, frame.shape, transform) > 0
@@ -100,6 +110,6 @@ class RubCheck:
             cv2.circle(photo, point, 8, (255, 255, 255), 2)
             cv2.putText(photo, f"NEW {index}", (point[0] + 10, point[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-        result.update(status="NEW_RUB", message=rubbing_result(locations, self.recommendation),
+        result.update(status="NEW_RUB", message="New rub detected on the stone.",
                       new_mask=new, locations=locations, preview=preview)
         return result

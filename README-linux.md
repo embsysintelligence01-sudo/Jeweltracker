@@ -78,22 +78,32 @@ A separate GUI timer previews fresh camera frames without waiting for inference;
 old overlays expire. The export has fixed float32 input [1,3,320,320]
 and one class, gold. Full-frame live and still-capture passes use 320.
 The older `nivagar_gold_v3.onnx` and `rubbing_gold.onnx` files are retained
-but are not loaded. Automatic stone detection uses only `newstone1.onnx`; the temporal
-acid detector/classifier remain under `acid_test/`.
+but are not loaded. Live stone detection uses `INT8_openvino_model/best.xml`
+and its companion `best.bin`; the temporal acid detector/classifier remain
+under `acid_test/`.
 
-Automatic stone checks use fresh frames with a target start-to-start interval
-of 0.5 seconds, including inference time. The highest-confidence model box
+Automatic stone checks run continuously on the newest available camera frame.
+There is no fixed 0.5-second interval and no queue of old frames. A 5 ms idle
+wait applies only when the camera has no new frame. The highest-confidence model box
 whose centre lies inside the ROI is used (minimum confidence 0.20). Dark-shape
 search, darkness/shape/white-bench filters and retention of an old automatic
 box during occlusion have been removed. A missed, failed or expired prediction
-clears the automatic box. Covering the stone can therefore interrupt an acid
-test that requires a stable stone box. The explicit **Draw stone** manual
+clears the automatic box. A confirmed acid snapshot keeps its saved box/mask
+through these live model misses using the fixed region described below. The explicit **Draw stone** manual
 fallback is still available. Stone inference runs on its own thread. OpenVINO
-reads the original `newstone1.onnx` directly, retaining float32 precision and
-the fixed 640x640 input, with one stream and two CPU threads. YOLO letterboxing,
-confidence, NMS and mask-validity decoding match the original predictor.
-Weights and class labels are unchanged. This reduces contention with the
-jewellery/rubbing model; actual update speed still depends on CPU load.
+loads the supplied INT8 IR at fixed 640x640 input, with one stream and two CPU
+threads. Inputs remain normalized float32 BGR-to-RGB tensors; the quantized
+graph runs integer operations internally. YOLO letterboxing, confidence, NMS
+and mask-validity decoding match the INT8 model's Ultralytics predictor.
+The original ONNX files remain available for reference comparisons. Before-rubbing
+snapshots share the live worker's INT8 model, including its segmentation output.
+Actual update speed and detection accuracy depend on CPU load and the new weights.
+
+The 26 October saved-frame replay measured stone updates increasing from 2.0
+to 4.8 per second, with concurrent mean stone processing falling from 376 to
+210 ms. Jewellery updates changed from 11.0 to 9.3 per second because the stone
+worker is now continuous. See the [INT8 measurements](diagnostics/stone_int8_20261026/REPORT.md)
+for the method, detection differences and live-validation limits.
 
 Preview overlays now share the 0.5-second observation age limit. Previously,
 their 0.3-second expiry included model processing time, causing boxes to blink
@@ -167,24 +177,69 @@ The tracker requires the supplied `rojeweltrack.onnx`; it does not fall back to 
 
 The main application uses `new_rub_detection.flow.RubCheck` with the existing
 camera. Its separate Qt6 demo is not launched. When the stone is first visible,
-the tracker captures a before-rubbing reference in a background job, detects old
-marks with `new_rub_detection/models/rubbedmask.onnx`, and displays the Z1–Z4
-grid with a blue recommended clear target. Wait for this guidance before rubbing.
-Use **Capture / retake rubbing reference** after clearing hands, or after cleaning
-when the result says **CLEAN THE STONE**. An invalid reference blocks rubbing
+the tracker captures a before-rubbing reference in a background job. It uses the
+highest-confidence INT8 stone prediction inside the configured ROI, derives the
+oriented surface quadrilateral using the photo app's contour geometry, and keeps
+the actual segmentation mask inside that outline. The enclosing rectangular box
+is never filled as the usable surface: test-bed pixels outside the mask are
+excluded even when inside that box. This cannot repair a model mask that itself
+incorrectly includes the bed; unclear surface geometry requires a retake.
+
+The flow uses the stone model and image alignment without AprilTag detection.
+A clear before-rubbing image stores the stone mask, oriented quad and starting
+marks. The flow detects old
+marks with `new_rub_detection/models/rubbedmask.onnx`. It saves these marks as the
+baseline without recommending a zone or drawing a target. Wait for the reference
+before rubbing. The original clear-space check is retained: when existing marks
+leave no usable clear patch, **CLEAN THE STONE** asks the operator to clean the
+stone and capture a new reference. Rubbing credit and acid testing stay blocked
+until a valid reference is captured. This check runs even when the old-mark
+overlay is OFF, and does not display a zone recommendation or blue target.
+Use **Capture / retake rubbing reference** after clearing hands or cleaning the
+stone. An invalid reference blocks rubbing
 credit; it does not disable bench guarding or the fresh video preview.
+An unsuccessful manual retake keeps the previous reference/masks in memory while
+blocking new rubbing credit until the retake succeeds. A validated dirty surface
+still requires cleaning; Reset, camera/ROI changes and a completed jewel start a
+new reference cycle. Captures process one fresh image in the background, with no
+marker search, capture burst or marker-related retake requirement.
 
-After RUBBED, **Start acid test** first captures an after-rubbing image. Remove
+**Automatic tests (ON)** is enabled by default. After Jn is RUBBED, return that
+same tracked jewel to the bench, outside the stone. Two seconds of observed
+settling automatically starts the after-rubbing check. The jewel check uses its
+smoothed centre with a fixed tolerance (minimum 6 pixels, or 3% of the initial
+box diagonal); changing box width/height does not restart the timer. The stone
+check uses a fixed reference crop and image changes, ignoring later predicted
+box dimensions. It tolerates small uniform brightness changes. Brief detection
+misses pause settling, and gaps over 0.75 seconds restart unfinished settling;
+only fresh camera timestamps count. The saved reference/masks are retained.
+
+The automatic trigger captures an after-rubbing image. With Automatic tests OFF,
+use **Start acid test** to capture it manually. Remove
 hands/jewellery and keep acid off the stone. The reference and current image are
-aligned, including supported stone rotation, and only newly added marks are
+aligned using the detected stone corners and existing image matching. Both photos
+need a clear stone surface for the new-mark comparison. Only newly added marks are
 accepted. **RETAKE** holds the acid flow and allows another after capture using
-the same before reference. The suggested grid zone is guidance; a valid new mark
-in another zone is accepted. Once confirmed, the preview and live outline show
-only the new-rub acid ROI, rather than the whole grid or old marks.
+the same before reference. A new mark can appear anywhere on the stone. Regions
+touching old marks, including a 12-pixel buffer in the normalized reference, are
+excluded completely. Rubbing over an old mark or leaving the stone unchanged
+shows **No new rub detected. Please rub on a clear area and retry.** Uncertain
+alignment remains a separate retry error and does not confirm a new mark.
 
-The pH ON/OFF selection still applies. At **Ready for stone test**, the saved
-new-mark mask is re-aligned onto a fresh, clear stone image. If alignment is
-unclear or the stone is covered, the flow waits and retains pH progress. Apply
+**Show existing rub marks (OFF/ON)** controls green starting-mark overlays in
+the before/after preview. It defaults to OFF. Toggling redraws the saved preview
+immediately without capturing another image or changing the baseline masks or
+detection. Confirmed new marks remain magenta when this switch is OFF, and the
+live acid ROI remains available. The fixed **Rub spot** photo is separate.
+
+The pH ON/OFF selection still applies. Once the new rub is confirmed, its stone
+box and mask are fixed. If pH is ON, fresh-paper/reaction verification must pass
+first; OFF explicitly skips it. In Automatic mode, **AUTO_STONE_SETTLE** then
+waits for two seconds of quiet images in the confirmed stone region before
+starting the baseline. Remove paper/hands during this handoff. Manual mode waits
+for **Ready for stone test**. Both modes reuse the saved region without another
+stone inference or image-alignment requirement. Keep the stone
+in the same position from new-rub confirmation until the test finishes. Apply
 acid only at **NOW APPLY ACID**, over the magenta mark; spreading beyond it is
 allowed. The detected acid box must overlap at least 50% of the smaller of the
 box and saved mask areas. Its centre must stay inside the stone, but may be
@@ -194,14 +249,32 @@ required. Detections elsewhere without sufficient overlap, including gaps
 between new marks inside their shared bounding box, do not confirm acid
 application. Matching uses the detected box rather than a segmented acid outline.
 
+Temporary hand occlusion and missing or partial live stone predictions do not
+abort Ready/capture or erase the confirmed box and mask. The acid flow does not
+re-check live stone positions or wait for a marker before classification. The
+operator keeps the stone still after confirmation. Camera loss, stale frames and
+changed camera resolution still require a retry.
+
 Each completed test saves before/after photos, old/new normalized masks,
-`new_rub_roi.png`, grid recommendation and mask acceptance settings in its
-capture directory. The next jewel gets a fresh before reference including
-previous marks. Cancel, Reset, changed zones and camera reconnection invalidate
+`new_rub_roi.png`, reference details and mask acceptance settings in its
+capture directory. After completion, **Next jewel paused** waits for cleaning;
+it does not immediately capture another before reference. The existing acid
+detector checks the whole oriented stone at confidence 0.60. A valid, uncovered
+surface, at least three acid-free observations, and two seconds of observed
+image stability are required before the next reference is saved automatically.
+Acid, hand/cloth coverage, missing surface observations and movement keep the
+next jewel blocked without erasing the previous jewel's result. Only fresh
+frames count; a camera/processing gap over 1.5 seconds restarts this check.
+The accepted clear photo supplies both the stone mask and the next before
+reference, including any remaining old marks. The operator must dry the stone;
+the detector's absence of acid is not a measurement of dryness. Manual retake
+cannot bypass the cleanup wait. This handoff also runs with Automatic tests OFF.
+Acid checks stop once the reference is ready. Cancel, Reset, changed zones and camera reconnection invalidate
 in-flight snapshot results. Native snapshot work finishes safely on shutdown.
 
-Snapshot models load lazily and are reused. They run on before/after captures;
-only the stone/geometry check repeats at readiness retries. Continuous jewellery
+The rubbed-mask model loads lazily and is reused on before/after captures. The
+shared INT8 model is serialized during cleanup and before/after surface captures; Ready
+and acid capture reuse the confirmed geometry without further stone inference. Continuous jewellery
 tracking still uses its single full-frame pass at confidence 0.15. The supplied
 snapshot rubbed-mask model retains its separate 0.50 threshold. No second camera
 reader is opened and no model is retrained.
@@ -209,8 +282,8 @@ reader is opened and no model is retrained.
 ## Camera and flow
 
 The main worker, ResNet identity model and rubbing watcher load on this PC.
-The integrated temporal acid worker starts only after a confirmed rubbed
-jewel's **Start acid test** button is clicked. A USB camera became available
+The integrated temporal acid worker starts after a confirmed new-rub mask,
+triggered by automatic settling or the manual **Start acid test** button. A USB camera became available
 during the final check: the live GUI received 2560x1440 frames and reached
 LOCKED tracking at about 7.5 FPS. Startup and shutdown both completed cleanly.
 The earlier setup had no camera connected. Full physical rubbing and acid
@@ -219,16 +292,15 @@ reaction verification still needs an operator test.
 Use the top bar to select USB/network/custom camera sources. Redraw ROI/stone
 zones if the view differs from the saved `zones.json` view.
 
-Rub any untested jewel first. Once its rubbing is confirmed, remove the
-jewel/hands and press **Start acid test for Jn**. Show fresh yellow pH paper
-in the camera, then add acid to that same paper until its pink reaction is
-verified. This OpenVINO CPU check is required for every jewel and every retry.
-After pH verification the test pauses. Remove paper/hands and click
-**Ready for stone test**, wait through the two-second stone baseline, apply acid to the streak
-only at **NOW APPLY ACID**, and keep still for observation. The same jewel's
-row receives **22K GOLD**, **NON-GOLD**, or **INCONCLUSIVE**, with confidence.
-Then rub any next untested jewel. The original detection/identity guarding
-continues during the acid capture. Only one jewel's cycle can be active.
+Rub any untested jewel first. With **Automatic tests ON**, return that jewel to
+the bench and keep it and the stone settled for two seconds. The after image
+must confirm a new rub. With pH ON, show fresh yellow paper, then add acid to
+that same paper until the pink reaction is verified. With pH OFF, paper is
+skipped. Remove paper/hands; after two seconds of stone settling, the baseline
+starts automatically. Apply acid only at **NOW APPLY ACID** and keep still for
+observation. Automatic tests OFF retains the Start/Ready buttons. The same
+jewel's row receives **22K GOLD**, **NON-GOLD**, or **INCONCLUSIVE**, with
+confidence. Only one jewel cycle runs at a time, while identity guarding continues.
 The next rubbing is not credited until the current classification finishes.
 Cancel/error allows retry for the same jewel; Reset starts a fresh batch.
 
@@ -286,9 +358,9 @@ The pH gate is installed in both the active `jewel_tracker` application and
 `jewel_tracker_full_backup`. Each launcher uses its own `.venv`; both require
 OpenVINO. Startup logs now identify the script and Python interpreter. After
 Start acid test, Events logs `PH_LOADING`, `PH_READY`, `PH_FRESH`,
-`PH_REACTION`, `PH_VERIFIED`, and `WAIT_FOR_STONE_READY` before the stone
-baseline. The **Ready for stone test** button is enabled only in the waiting
-phase, and the baseline starts only after that button is clicked. Model-loading
+`PH_REACTION`, `PH_VERIFIED`, then `AUTO_STONE_SETTLE` (automatic mode) or
+`WAIT_FOR_STONE_READY` (manual mode) before the stone baseline. The Ready button
+is enabled only for manual readiness; automatic mode advances after settling. Model-loading
 errors remain visible for retry, and their tracebacks go to `jewel_guard.log`.
 The active application's CPU loading check is recorded in
 `diagnostics/ph_gate_loading_20261022/model_check.json` (no physical acid test).

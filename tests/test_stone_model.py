@@ -83,15 +83,33 @@ class StoneModelTests(unittest.TestCase):
         self.watcher.update(self.frame)
         self.assertIsNone(self.watcher.bbox)
 
-    def test_loop_uses_latest_frame_and_inference_counts_toward_interval(self):
+    def test_loop_processes_fresh_frames_without_sleeping_between_predictions(self):
+        self.result([(60, 60, 220, 220)], [.9])
+        self.watcher.grabber = Mock()
+        now = time.time()
+        self.watcher.grabber.latest.side_effect = [(self.frame, now), (self.frame, now + .001)]
+        observations = []
+        def update(frame, captured_at):
+            observations.append(captured_at)
+            if len(observations) == 2:
+                self.watcher.running = False
+        with patch.object(self.watcher, 'update', side_effect=update), \
+             patch.object(tracker.time, 'sleep') as sleep:
+            self.watcher.run()
+        self.assertEqual([now, now + .001], observations)
+        self.assertEqual(2, self.watcher.grabber.latest.call_count)
+        self.assertTrue(all(call.kwargs == dict(copy_frame=False)
+                            for call in self.watcher.grabber.latest.call_args_list))
+        sleep.assert_not_called()
+
+    def test_loop_does_not_predict_same_frame_twice(self):
         self.result([(60, 60, 220, 220)], [.9])
         self.watcher.grabber = Mock()
         self.watcher.grabber.latest.return_value = (self.frame, time.time())
-        with patch.object(tracker.time, 'monotonic', side_effect=[10., 10.35]), \
-             patch.object(tracker.time, 'sleep', side_effect=lambda _: setattr(self.watcher, 'running', False)) as sleep:
+        with patch.object(tracker.time, 'sleep', side_effect=lambda _: setattr(self.watcher, 'running', False)) as sleep:
             self.watcher.run()
-        self.watcher.grabber.latest.assert_called_once_with(copy_frame=False)
-        self.assertAlmostEqual(tracker.STONE_CHECK_S - .35, sleep.call_args.args[0])
+        self.model.predict.assert_called_once()
+        sleep.assert_called_once_with(.005)
 
     def test_stale_camera_frame_is_not_sent_to_model(self):
         self.watcher.bbox = (60, 60, 220, 220)
@@ -128,9 +146,9 @@ class StoneBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = StoneOnnxModel(tracker.STONE_MODEL_PATH)
-        cls.reference = tracker.YOLO(tracker.STONE_MODEL_PATH, task='segment')
+        cls.reference = tracker.YOLO(str(Path(tracker.STONE_MODEL_PATH).parent), task='segment')
 
-    def test_original_onnx_boxes_and_confidence_are_preserved(self):
+    def test_int8_boxes_and_confidence_match_ultralytics_decoding(self):
         root = Path(tracker.SCRIPT_DIR)
         paths = [root / 'diagnostics/antiflicker_20261021/final_verified_00.jpg',
                  root / 'captures/20261017_145247_capture.jpg',
@@ -144,12 +162,26 @@ class StoneBackendTests(unittest.TestCase):
                 np.testing.assert_allclose(actual.boxes.data.numpy(), expected.boxes.data.numpy(), atol=.01, rtol=0)
                 self.assertEqual({0: 'St'}, actual.names)
 
-    def test_execution_is_bounded_and_keeps_float32_precision(self):
-        import openvino as ov
-
+    def test_execution_is_bounded_and_uses_quantized_operations(self):
         self.assertEqual(1, self.model.compiled.get_property('NUM_STREAMS'))
         self.assertEqual(2, self.model.compiled.get_property('INFERENCE_NUM_THREADS'))
-        self.assertEqual(ov.Type.f32, self.model.compiled.get_property('INFERENCE_PRECISION_HINT'))
+        self.assertTrue(self.model.quantized)
+        precisions = {op.get_rt_info()['runtimePrecision'].value
+                      for op in self.model.compiled.get_runtime_model().get_ops()
+                      if 'runtimePrecision' in op.get_rt_info()}
+        self.assertTrue({'i8', 'u8'} & precisions)
+
+    def test_snapshot_masks_restore_camera_coordinates_without_letterbox_padding(self):
+        frame = tracker.cv2.imread(str(Path(tracker.SCRIPT_DIR) /
+                                      'diagnostics/aruco_check_20261026_123020/initial_15.jpg'))
+        result = self.model.predict(frame, return_masks=True)[0]
+        self.assertIsNotNone(result.masks)
+        self.assertEqual(frame.shape[:2], tuple(result.masks.data.shape[1:]))
+        for box, mask in zip(result.boxes.xyxy.numpy(), result.masks.data.numpy()):
+            y, x = np.where(mask)
+            bounds = (x.min(), y.min(), x.max()+1, y.max()+1)
+            self.assertGreater(tracker.box_iou(bounds, box), .8)
+        self.assertIsNone(self.model.predict(frame)[0].masks)
 
 
 if __name__ == '__main__':

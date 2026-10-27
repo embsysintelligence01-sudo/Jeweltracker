@@ -7,7 +7,7 @@ Python 3.10 or newer is required.
 
 | File | Used for |
 | --- | --- |
-| `flow.py` | `RubCheck`: reusable before-photo, zone suggestion, and after-photo comparison API, without a GUI or camera. |
+| `flow.py` | `RubCheck`: reusable before/after comparison without zone recommendations, with strict old-mark exclusion. |
 | `core.py` | Stone ONNX inference; mark merging; exclusion of old marks; new-mark locations; drawing overlays. Functions are extracted from the working `App.py`. |
 | `geometry.py` | Four stone corners, 512×512 normalization, feature/image alignment, and projecting masks back onto the photo. |
 | `rubbing_zones.py` | Z1–Z4 clear-space analysis, target selection, instructions, and blue target drawing. |

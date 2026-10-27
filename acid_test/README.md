@@ -65,18 +65,19 @@ are bounded to 224 pixels and update one cell without rebuilding the table.
 
 1. Prepare a clean, dry stone or fresh reaction area. Place jewels/stone and
    let the existing tracker assign identities. Keep hands clear while the
-   automatic before-rubbing reference analyzes old marks and recommends a blue
-   target in the Z1–Z4 preview. Use **Capture / retake rubbing reference** if
+   automatic before-rubbing reference records old marks without recommending a
+   target. Use **Capture / retake rubbing reference** if
    requested; clean the stone when no usable clear space remains.
 2. Wait for reference guidance, then rub any untested jewel. The existing segmented gold-centroid movement
    logic assigns rubbing to that jewel; numeric order is unrestricted.
-3. When Jn is confirmed RUBBED, further rubbing credit is paused. Remove the
-   jewel and hands and press **Start acid test for Jn**. Select the observation
-   duration and optionally enter the acid grade/batch before pressing Start.
-   This first compares an after photo with the before reference. Only a confirmed
-   new mark enables acid verification; **RETAKE** keeps the old reference for retry.
-   The confirmed new mark, including one outside the recommended zone, becomes
-   this jewel's saved acid ROI. Old marks and the whole grid cell are excluded.
+3. When Jn is confirmed RUBBED, further rubbing credit is paused. With
+   **Automatic tests ON** (default), return that same jewel to the bench outside
+   the stone; two seconds of settled jewel position and stone image starts the
+   after-photo check. Box size/aspect-ratio changes are ignored. Brief misses
+   pause the timer; clear movement restarts it. With Automatic tests OFF, use
+   **Start acid test for Jn**. Select duration/batch before the test starts.
+   Only a confirmed new mark enables acid verification; RETAKE retains the old
+   reference. The accepted new mark becomes this jewel's saved acid ROI.
 4. With **pH verification ON**, show unused yellow pH paper in the existing camera view. OpenVINO OBB
    detects the strip; the supplied color SOP requires 8 fresh-yellow detections,
    then 2 sustained pink-reaction detections on the same strip. Add acid to
@@ -85,11 +86,12 @@ are bounded to 224 pixels and update one cell without rebuilding the table.
    The check verifies an indicator reaction; it does not identify the reagent.
    With pH OFF this stage is skipped and recorded as `SKIPPED_BY_OPERATOR`.
    Hiding the stone during the pH stage does not restart verification.
-5. After **pH reaction verified**, the test pauses. Remove paper/hands, then
-   click **Ready for stone test**. Only this click starts the two-second stone
-   baseline, after relocating the saved new-rub mask onto the current stone.
-   Unclear alignment or a hidden stone waits for a new Ready click while
-   preserving pH progress. Apply acid over the magenta mark at **NOW APPLY ACID**;
+5. After **pH reaction verified** (or pH OFF), remove paper/hands. Automatic
+   mode enters AUTO_STONE_SETTLE and starts the two-second baseline after two
+   seconds of quiet images. Manual mode waits for **Ready for stone test**.
+   The confirmed new-rub box/mask stays fixed; no new stone-model detection or
+   alignment is required at Ready or during acid capture. Keep the stone in
+   position. Apply acid over the magenta mark at **NOW APPLY ACID**;
    the liquid may spread beyond the mark. Detection must repeat three times
    at IoU >= 0.45 and confidence >= 0.60, with its centre inside the stone.
    The detected acid box must overlap at least 50% of the smaller box/mask
@@ -99,7 +101,15 @@ are bounded to 224 pixels and update one cell without rebuilding the table.
    location. This check uses the detector box, not a segmented liquid outline.
 6. Keep the stone/camera still during observation (5 seconds by default).
    The table receives **22K GOLD**, **NON-GOLD**, or **INCONCLUSIVE** plus
-   confidence. Wait for the next before-reference guidance before rubbing another jewel.
+   confidence. Clean and dry the stone. **Next jewel paused** checks for acid
+   across the whole oriented stone, using the existing detector at 0.60.
+   At least three acid-free observations, an uncovered surface and two seconds
+   of stillness trigger the next before-rubbing reference automatically.
+   Wiping, hand/cloth coverage and missing surface observations keep waiting;
+   the completed result remains saved. The accepted clear photo also records
+   remaining old marks. Dryness remains the operator's responsibility.
+   Manual retake cannot skip this wait; it applies with Automatic tests ON or
+   OFF. Rub the next jewel only after the reference is ready.
 7. The existing DONE behavior additionally waits for the jewel to rest off
    the stone. DONE means the process finished, including an inconclusive
    classification; it does not mean that the material was classified gold.
@@ -114,17 +124,19 @@ ImageNet normalization, and thresholds 0.85 for gold and 0.65 generally.
 `runtime.py` is shared with the standalone UI; integrated capture behavior
 is in `sequence.py` and `integration.py`.
 
-Cancel or a camera/detection error keeps the same rubbed jewel selected for
-retry. Prepare its streak appropriately before retrying. Stone movement or
-camera resolution changes fail the capture. Reset or camera disconnect
-cancels a running test; unique batch/test tokens reject late results. A new
-batch must establish rubbing again. There are separate 120-second pH-verification and acid-detection
-wait timeouts and a three-second camera-frame timeout. No temporal baseline,
-stone acid detection, or classification starts before the pH check passes
-and the operator clicks **Ready for stone test**. There is no operator deadline
-for this pause; camera freshness, resolution, and stone position remain guarded.
-Cancel/reset/reconnect discards the confirmation, so every retry and jewel must
-pass pH verification and receive its own readiness click.
+Cancel or an error keeps the same rubbed jewel and saved target for retry.
+Automatic relaunch is paused after cancellation or an acid error; use Start or
+switch Automatic tests OFF/ON to resume. A failed photo check waits for movement
+before an automatic retry. No test is automatically repeated on a static scene.
+Reset/disconnect cancel the attempt; batch/test tokens reject late results.
+Camera resolution changes and stale frames still fail the attempt. Temporary
+missing or partial live stone boxes cannot abort a confirmed target's capture.
+
+There are separate 120-second pH and acid-detection timeouts, and a three-second
+camera-frame timeout. With pH ON, no stone baseline/detection/classification
+starts before the reaction is verified. Each automatic attempt then settles the
+stone; each manual attempt requires its own Ready click. The result manifest
+records `automatic_test` along with the pH setting and verification evidence.
 
 ## Saved captures and future training
 

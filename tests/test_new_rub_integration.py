@@ -18,7 +18,7 @@ from acid_test.integration import AcidTestThread
 from acid_test.onnx_detector import Detection
 from acid_test.sequence import AcidSequence
 from new_rub_detection.geometry import DEST, SIZE
-from rub_preparation import RubCycle, RubPhotoModels
+from rub_preparation import RubCycle, RubPhotoModels, render_rub_preview
 
 
 def photos():
@@ -37,14 +37,14 @@ def pending_track():
 
 
 class RubSnapshotTests(unittest.TestCase):
-    def test_before_guidance_and_new_only_mask_survive_rotation(self):
+    def test_before_reference_and_new_only_mask_survive_rotation(self):
         frame, stone, old = photos()
         models = Mock()
         models.photo.return_value = (stone, old, DEST)
         cycle = RubCycle(models)
         before = cycle.before(frame)
         self.assertEqual('READY', before['status'])
-        target_point = before['recommendation'].target
+        target_point = (180, 180)
         after, marks = frame.copy(), old.copy()
         cv2.circle(after, target_point, 12, (220,220,220), -1)
         cv2.circle(marks, target_point, 12, 255, -1)
@@ -53,10 +53,12 @@ class RubSnapshotTests(unittest.TestCase):
         self.assertEqual('NEW_RUB', result['status'])
         self.assertEqual(0, np.count_nonzero(target.new_mask & old))
         self.assertGreater(np.count_nonzero(target.roi_mask), 100)
-        models.surface.return_value = (stone, DEST)
-        located = target.locate(after)
+        models.surface.side_effect = RuntimeError('live model missed under the hand')
+        located = target.locate(np.rot90(after).copy())
         expected = np.zeros_like(stone)
         cv2.circle(expected, target_point, 12, 255, -1)
+        expected = np.rot90(expected).copy()
+        models.surface.assert_not_called()
         intersection = np.count_nonzero((located['roi_mask'] > 0) & (expected > 0))
         union = np.count_nonzero((located['roi_mask'] > 0) | (expected > 0))
         self.assertGreater(intersection / union, .8)
@@ -71,14 +73,15 @@ class RubSnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'RETAKE'):
             cycle.after(frame)
 
-    def test_cleaning_required_blocks_after_check(self):
+    def test_fully_marked_stone_requires_cleaning_and_blocks_after_check(self):
         frame, stone, _ = photos()
         models = Mock(photo=Mock(return_value=(stone, stone, DEST)))
         cycle = RubCycle(models)
         result = cycle.before(frame)
         self.assertEqual('CLEAN_THE_STONE', result['status'])
+        self.assertIn('Clean the stone', result['message'])
         self.assertIsNone(cycle.before_result)
-        with self.assertRaisesRegex(RuntimeError, 'reference'):
+        with self.assertRaisesRegex(RuntimeError, 'before-rubbing reference'):
             cycle.after(frame)
 
     def test_real_snapshot_models_use_existing_frame_without_camera(self):
@@ -90,6 +93,41 @@ class RubSnapshotTests(unittest.TestCase):
         self.assertEqual(frame.shape[:2], marks.shape)
         self.assertEqual((4,2), quad.shape)
         self.assertGreater(np.count_nonzero(stone), 1000)
+
+    def test_rubbing_over_old_mark_cannot_confirm_even_when_mask_grows(self):
+        frame, stone, old = photos()
+        models = Mock(photo=Mock(return_value=(stone, old, DEST)))
+        cycle = RubCycle(models)
+        cycle.before(frame)
+        after, marks = frame.copy(), old.copy()
+        # Most of this component is outside the old mask; it still touches it.
+        cv2.rectangle(after, (70, 70), (200, 90), (220, 220, 220), -1)
+        cv2.rectangle(marks, (70, 70), (200, 90), 255, -1)
+        models.photo.return_value = (stone, marks, DEST)
+        with self.assertRaisesRegex(RuntimeError, 'No new rub detected'):
+            cycle.after(after)
+
+    def test_hiding_old_marks_keeps_new_mark_visible_and_masks_unchanged(self):
+        frame, stone, old = photos()
+        models = Mock(photo=Mock(return_value=(stone, old, DEST)))
+        cycle = RubCycle(models)
+        before = cycle.before(frame)
+        np.testing.assert_array_equal(frame, render_rub_preview(before, False))
+        self.assertFalse(np.array_equal(frame, render_rub_preview(before, True)))
+        after, marks = frame.copy(), old.copy()
+        cv2.circle(after, (180, 180), 12, (220, 220, 220), -1)
+        cv2.circle(marks, (180, 180), 12, 255, -1)
+        models.photo.return_value = (stone, marks, DEST)
+        result, target = cycle.after(after)
+        saved_mask = target.roi_mask.copy()
+        hidden = render_rub_preview(result, False)
+        shown = render_rub_preview(result, True)
+        np.testing.assert_array_equal(hidden[180, 180], shown[180, 180])
+        self.assertGreater(int(hidden[180, 180, 0]), int(hidden[180, 180, 1]))
+        self.assertFalse(np.array_equal(hidden[76, 76], shown[76, 76]))
+        np.testing.assert_array_equal(saved_mask, target.roi_mask)
+        np.testing.assert_array_equal(old, cycle.check.old_mask)
+        self.assertEqual(2, models.photo.call_count)
 
 
 class AcidMaskTests(unittest.TestCase):
@@ -193,6 +231,7 @@ class MainRubFlowTests(unittest.TestCase):
             self.window = app.MainWindow()
         self.window.rub_timer.stop()
         self.window.preview_timer.stop()
+        self.window.chk_auto_test.setChecked(False)
         self.window.add_log = Mock()
         with patch.object(app, 'JewelIdModel', return_value=None):
             self.worker = app.Worker(0, [(0,0),(511,0),(511,511),(0,511)])
@@ -231,7 +270,7 @@ class MainRubFlowTests(unittest.TestCase):
     def test_auto_reference_and_start_acid_after_check(self):
         self.prepare()
         cycle = self.window.rub_cycle
-        point = cycle.before_result['recommendation'].target
+        point = (180, 180)
         after, marks = self.frame.copy(), self.old.copy()
         cv2.circle(after, point, 12, (220,220,220), -1)
         cv2.circle(marks, point, 12, 255, -1)
@@ -251,9 +290,189 @@ class MainRubFlowTests(unittest.TestCase):
         np.testing.assert_array_equal(tr.new_rub_target.roi_mask, tr.acid_roi_mask)
         self.window.launch_acid_test.assert_called_once()
         self.assertEqual(2, self.window.rub_models.photo.call_count)
+        self.worker.stone_box.return_value = None
         context = self.worker.begin_acid_test(False)
         self.assertIs(tr.new_rub_target, context['rub_target'])
+        self.assertEqual(tr.new_rub_target.stone, context['stone'])
         np.testing.assert_array_equal(tr.acid_roi_mask, context['roi_mask'])
+
+    def completed_test_for_cleanup(self):
+        self.prepare()
+        self.window.rub_models.surface.return_value = (self.stone, DEST)
+        self.window.rub_models.marks.return_value = self.old
+        detector, classifier = Mock(), Mock()
+        detector.predict.return_value = ([], 1.)
+        self.window.acid_models = Mock(get=Mock(return_value=(detector, classifier)))
+        tr = pending_track()
+        self.worker.tracks, self.worker.acid_pending_id = [tr], tr.id
+        self.worker.acid_token, self.worker.acid_ph_required = 'finished', False
+        record = dict(detector_bbox=(160, 160, 200, 200),
+                      prediction=dict(prediction='non_gold', confidence=.94),
+                      ph_verification=dict(result='SKIPPED_BY_OPERATOR'))
+        self.assertTrue(self.worker.finish_acid_test(dict(token='finished', jewel_id=1, result=record)))
+        self.window.refresh_acid_controls()
+        self.assertTrue(self.worker.stone_cleanup_pending)
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertFalse(self.window.btn_rub_reference.isEnabled())
+        self.assertFalse(self.window.btn_start_acid.isEnabled())
+        return tr, record, detector, classifier
+
+    def cleanup_tick(self, ts):
+        with patch.object(app.time, 'time', return_value=ts):
+            self.window.rub_guidance_tick()
+            self.window.rub_guidance_tick()
+
+    def test_completion_waits_for_acid_removal_then_captures_next_reference(self):
+        tr, record, detector, classifier = self.completed_test_for_cleanup()
+        detector.predict.return_value = ([Detection((160, 160, 200, 200), .95)], 1.)
+        # Live detector misses do not erase the result or interrupt cleaning.
+        self.worker.stone_box.return_value = None
+        for i in range(12):
+            self.cleanup_tick(100.+i*.25)
+            self.assertFalse(self.worker.rub_reference_ready)
+        self.assertIn('Acid is still detected', self.window.rub_instruction.text())
+        self.assertTrue(self.window.chk_ph_verification.isEnabled())
+        self.assertIs(record, tr.acid_result)
+        self.assertTrue(tr.acid_done)
+        self.window.rub_models.marks.assert_not_called()
+        # The manual capture control also cannot bypass the cleaning wait.
+        self.window.capture_rub_reference(manual=True)
+        self.assertFalse(self.worker.rub_reference_ready)
+        detector.predict.return_value = ([], 1.)
+        for i in range(8):
+            self.cleanup_tick(103.+i*.25)
+            self.assertFalse(self.worker.rub_reference_ready)
+        self.cleanup_tick(105.)
+        self.assertTrue(self.worker.rub_reference_ready)
+        self.assertFalse(self.worker.stone_cleanup_pending)
+        self.assertIsNotNone(self.window.rub_cycle.before_result)
+        self.window.rub_models.marks.assert_called_once()
+        self.assertEqual(1, self.window.rub_models.photo.call_count)
+        self.assertIs(record, tr.acid_result)
+        classifier.predict.assert_not_called()
+        # No extra idle acid inference once the next reference is saved.
+        calls = detector.predict.call_count
+        self.cleanup_tick(106.)
+        self.assertEqual(calls, detector.predict.call_count)
+
+    def test_cleanup_keeps_waiting_for_surface_without_a_stone_loss_error(self):
+        tr, record, detector, _ = self.completed_test_for_cleanup()
+        self.window.rub_models.surface.side_effect = RuntimeError('RETAKE - expose one complete stone')
+        for i in range(12):
+            self.cleanup_tick(100.+i*.25)
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertIn('Finish cleaning', self.window.acid_instruction.text())
+        self.assertNotIn('RETAKE', self.window.rub_instruction.text())
+        self.assertIs(record, tr.acid_result)
+        detector.predict.assert_not_called()
+
+    def test_reset_discards_inflight_cleanup_reference(self):
+        self.completed_test_for_cleanup()
+        for i in range(8):
+            self.cleanup_tick(100.+i*.25)
+        with patch.object(app.time, 'time', return_value=102.):
+            self.window.rub_guidance_tick()
+        self.assertEqual('READY', self.window.rub_job['future'].result()['status'])
+        self.worker.arm()
+        self.worker.stone_box.return_value = None
+        self.window.rub_guidance_tick()
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertFalse(self.worker.stone_cleanup_pending)
+        self.assertIsNone(self.window.rub_cleanup)
+        self.assertIsNone(self.window.rub_cycle.before_result)
+
+    def test_stale_camera_does_not_check_acid_or_capture_cleanup_reference(self):
+        self.completed_test_for_cleanup()
+        self.worker.grabber = SimpleNamespace(latest=lambda: (self.frame.copy(), 90.))
+        self.cleanup_tick(100.)
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertIsNone(self.window.rub_job)
+        self.assertIn('fresh camera', self.window.acid_instruction.text())
+        self.window.rub_models.surface.assert_not_called()
+
+    def prepare_automatic_return(self):
+        self.prepare()
+        self.window.chk_auto_test.setChecked(True)
+        # Use a fixed reference crop and a returned jewel outside that surface.
+        self.window.rub_cycle.stone = (220, 220, 470, 470)
+        tr = pending_track()
+        tr.pos = np.array((80., 80.))
+        tr.state = 'OK'
+        tr.det_box = (60, 60, 100, 100)
+        self.worker.tracks, self.worker.acid_pending_id = [tr], 1
+        return tr
+
+    def test_automatic_return_ignores_jewel_and_stone_box_shape_jitter(self):
+        tr = self.prepare_automatic_return()
+        self.window.start_acid_test = Mock()
+        for i in range(16):
+            ts = 100.+i*.2
+            tr.det_seen = ts
+            tr.pos = np.array((80.+i % 3, 80.-i % 3))
+            tr.det_box = (40-i, 45-i, 120+i, 115+i)
+            self.worker.stone_box.return_value = (210-i, 210-i, 470+i, 470+i)
+            with patch.object(app.time, 'time', return_value=ts):
+                self.window.auto_test_tick()
+            if i < 10:
+                self.window.start_acid_test.assert_not_called()
+        self.window.start_acid_test.assert_called_once_with(automatic=True)
+        self.assertEqual((220., 220., 470., 470.), self.window.auto_gate.stone)
+
+    def test_another_visible_jewel_cannot_satisfy_the_pending_jewels_return(self):
+        tr = self.prepare_automatic_return()
+        tr.det_seen = 0.
+        other = pending_track()
+        other.id, other.pos, other.det_seen, other.state = 2, np.array((100., 80.)), 101., 'OK'
+        self.worker.tracks.append(other)
+        self.window.start_acid_test = Mock()
+        for i in range(15):
+            ts = 100.+i*.2
+            other.det_seen = ts
+            with patch.object(app.time, 'time', return_value=ts):
+                self.window.auto_test_tick()
+        self.window.start_acid_test.assert_not_called()
+
+    def test_automatic_start_checks_new_rub_then_preserves_ph_first_setting(self):
+        tr = self.prepare_automatic_return()
+        after, marks = self.frame.copy(), self.old.copy()
+        cv2.circle(after, (400, 400), 12, (220, 220, 220), -1)
+        cv2.circle(marks, (400, 400), 12, 255, -1)
+        self.worker.grabber = SimpleNamespace(latest=lambda: (after.copy(), time.time()))
+        self.window.rub_models.photo.return_value = (self.stone, marks, DEST)
+        self.window.launch_acid_test = Mock()
+        for i in range(11):
+            ts = 100.+i*.2
+            tr.det_seen = ts
+            with patch.object(app.time, 'time', return_value=ts):
+                self.window.auto_test_tick()
+        self.assertIsNotNone(self.window.rub_job)
+        self.window.launch_acid_test.assert_not_called()
+        self.assertTrue(self.window.rub_job['ph_enabled'])
+        self.assertTrue(self.window.rub_job['auto_test'])
+        self.window.rub_guidance_tick()
+        self.assertIsNotNone(tr.new_rub_target)
+        args, kwargs = self.window.launch_acid_test.call_args
+        self.assertTrue(args[0])
+        self.assertTrue(kwargs['auto_test'])
+
+    def test_cancel_holds_automatic_start_until_explicit_resume(self):
+        tr = self.prepare_automatic_return()
+        self.window.start_acid_test = Mock()
+        self.window.cancel_acid_test()
+        for i in range(15):
+            ts = 100.+i*.2
+            tr.det_seen = ts
+            with patch.object(app.time, 'time', return_value=ts):
+                self.window.auto_test_tick()
+        self.window.start_acid_test.assert_not_called()
+        self.window.chk_auto_test.setChecked(False)
+        self.window.chk_auto_test.setChecked(True)
+        for i in range(11):
+            ts = 104.+i*.2
+            tr.det_seen = ts
+            with patch.object(app.time, 'time', return_value=ts):
+                self.window.auto_test_tick()
+        self.window.start_acid_test.assert_called_once_with(automatic=True)
 
     def test_retake_does_not_launch_ph_or_acid(self):
         self.prepare()
@@ -266,7 +485,79 @@ class MainRubFlowTests(unittest.TestCase):
         self.assertIsNone(self.worker.acid_token)
         self.window.launch_acid_test.assert_not_called()
         self.assertIn('RETAKE', self.window.rub_instruction.text())
+        self.assertIn('No new rub detected', self.window.rub_instruction.text())
         self.assertTrue(self.window.btn_start_acid.isEnabled())
+
+    def test_cleaning_prompt_blocks_rubbing_until_clean_stone_reference_is_retaken(self):
+        self.prepare()
+        self.window.rub_models.photo.return_value = (self.stone, self.stone, DEST)
+        self.window.capture_rub_reference(manual=True)
+        self.window.rub_guidance_tick()
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertIsNone(self.window.rub_cycle.before_result)
+        self.assertIn('CLEAN THE STONE', self.window.rub_instruction.text())
+        self.assertIn('CLEAN THE STONE', self.window.acid_instruction.text())
+        self.assertFalse(self.window.btn_start_acid.isEnabled())
+        self.assertTrue(self.window.btn_rub_reference.isEnabled())
+        for enabled in (True, False):
+            self.window.chk_existing_rub_marks.setChecked(enabled)
+            self.assertIn('CLEAN THE STONE', self.window.rub_instruction.text())
+            self.assertFalse(self.worker.rub_reference_ready)
+        # Live movement must not receive RUBBED credit while cleaning is required.
+        tr = pending_track()
+        tr.rubbed = False
+        self.worker.tracks, self.worker.rub_track = [tr], tr
+        self.worker.rubber = SimpleNamespace(snapshot=lambda: ({}, True, 100.), active=True)
+        self.worker.update_rubbing(100.)
+        self.assertFalse(tr.rubbed)
+        self.assertIsNone(self.worker.acid_pending_id)
+        # Cleaning and a manual retake restore readiness without choosing a zone.
+        self.window.rub_models.photo.return_value = (self.stone, self.old, DEST)
+        self.window.capture_rub_reference(manual=True)
+        self.window.rub_guidance_tick()
+        self.assertTrue(self.worker.rub_reference_ready)
+        self.assertIsNotNone(self.window.rub_cycle.before_result)
+        self.assertNotIn('CLEAN THE STONE', self.window.acid_instruction.text())
+        self.assertNotIn('zone', self.window.rub_instruction.text())
+
+    def test_failed_manual_retake_retains_saved_reference_and_keeps_credit_blocked(self):
+        self.prepare()
+        cycle = self.window.rub_cycle
+        before, old = cycle.before_result, cycle.check.old_mask.copy()
+        self.window.rub_models.photo.side_effect = RuntimeError('stone surface is temporarily unclear')
+        self.window.capture_rub_reference(manual=True)
+        self.window.rub_guidance_tick()
+        self.assertIs(cycle, self.window.rub_cycle)
+        self.assertIs(before, cycle.before_result)
+        np.testing.assert_array_equal(old, cycle.check.old_mask)
+        self.assertFalse(self.worker.rub_reference_ready)
+        self.assertIn('temporarily unclear', self.window.rub_instruction.text())
+
+    def test_existing_mark_toggle_redraws_without_recapture_or_changing_reference(self):
+        self.prepare()
+        self.assertFalse(self.window.chk_existing_rub_marks.isChecked())
+        hidden = self.window.rub_preview.pixmap().toImage()
+        old = self.window.rub_cycle.check.old_mask.copy()
+        self.window.chk_existing_rub_marks.setChecked(True)
+        self.assertIn('(ON)', self.window.chk_existing_rub_marks.text())
+        self.assertNotEqual(hidden, self.window.rub_preview.pixmap().toImage())
+        self.window.rub_instruction.setText('No new rub detected')
+        self.window.chk_existing_rub_marks.setChecked(False)
+        self.assertIn('(OFF)', self.window.chk_existing_rub_marks.text())
+        self.assertEqual(hidden, self.window.rub_preview.pixmap().toImage())
+        self.assertEqual('No new rub detected', self.window.rub_instruction.text())
+        np.testing.assert_array_equal(old, self.window.rub_cycle.check.old_mask)
+        self.assertTrue(self.worker.rub_reference_ready)
+        self.assertEqual(1, self.window.rub_models.photo.call_count)
+
+    def test_reset_clears_cached_mark_display_even_if_toggle_is_on(self):
+        self.prepare()
+        self.window.chk_existing_rub_marks.setChecked(True)
+        self.worker.arm()
+        self.window.sync_rub_cycle()
+        self.window.chk_existing_rub_marks.setChecked(False)
+        self.assertIsNone(self.window.rub_display_result)
+        self.assertIsNone(self.window.rub_preview.pixmap())
 
     def test_stale_reference_result_cannot_enable_a_reset_batch(self):
         self.window.rub_guidance_tick()
@@ -359,7 +650,7 @@ class TargetReadinessTests(unittest.TestCase):
                 models=Mock(photo=Mock(return_value=(stone,old,DEST)))
                 cycle=RubCycle(models)
                 before=cycle.before(frame)
-                x,y=before['recommendation'].target
+                x,y=(180,180)
                 after,marks=frame.copy(),old.copy()
                 cv2.circle(after,(x,y),12,(220,220,220),-1)
                 cv2.circle(marks,(x,y),12,255,-1)

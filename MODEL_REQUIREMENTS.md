@@ -7,11 +7,12 @@ Model weights are stored locally and excluded from GitHub.
 | weights/siglip2-base-patch32-256_vision_encoder.sim.onnx | SigLIP2 Base Patch32 256 vision encoder |
 | weights/resnet18-f37072fd.pth | ResNet18 pretrained weights |
 | weights/resnet18_features.onnx | ResNet18 feature extractor |
-| newstone1.onnx | Custom ONNX model |
+| INT8_openvino_model/best.xml and best.bin | Shared live/snapshot stone detector and masks; INT8 OpenVINO IR, fixed 640x640 input |
+| newstone1.onnx | Original stone ONNX retained for reference comparisons |
 | rubbing_gold.onnx | Custom ONNX model |
 | acid.onnx | Custom ONNX model |
 | rojeweltrack.onnx | Custom ONNX model |
-| new_rub_detection/models/newstone1.onnx | Stone mask/corners for before/after rubbing snapshots |
+| new_rub_detection/models/newstone1.onnx | Legacy standalone App.py stone model; integrated tracker uses shared INT8 |
 | new_rub_detection/models/rubbedmask.onnx | Existing and newly created rubbing marks; snapshot inference |
 | nivagar_gold_v3.onnx | Custom ONNX model |
 | nivagar_gold_v3.pt | Custom PyTorch model |

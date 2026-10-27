@@ -41,6 +41,36 @@ def normalize(frame, quad):
     return crop, matrix
 
 
+def stone_surface(mask, bbox):
+    """Return the oriented surface and its mask, never a filled detector box.
+
+    Use the same four-corner contour as the photo app. A small marker notch may
+    prevent four-corner approximation; a tightly filled rotated rectangle is a
+    fallback for that case. Uncertain geometry requires a new capture.
+    """
+    h, w = mask.shape
+    x1, y1, x2, y2 = np.clip(bbox, (0, 0, 0, 0), (w, h, w, h)).astype(int)
+    clipped = np.zeros_like(mask, dtype=np.uint8)
+    clipped[y1:y2, x1:x2] = (mask[y1:y2, x1:x2] > 0).astype(np.uint8)*255
+    contours, _ = cv2.findContours(clipped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise RuntimeError('RETAKE - stone surface mask unavailable')
+    contour = max(contours, key=cv2.contourArea)
+    component = cv2.drawContours(np.zeros_like(clipped), [contour], -1, 255, -1)
+    clipped = cv2.bitwise_and(clipped, component)
+    quad = stone_quad(clipped, (x1, y1, x2, y2))
+    if quad is None:
+        rect = cv2.minAreaRect(contour)
+        if min(rect[1]) < 80 or cv2.contourArea(contour)/max(1., rect[1][0]*rect[1][1]) < .90:
+            raise RuntimeError('RETAKE - stone corners unclear; expose the complete surface')
+        quad = cv2.boxPoints(rect).astype(np.float32)
+        center = quad.mean(axis=0)
+        quad = quad[np.argsort(np.arctan2(quad[:, 1]-center[1], quad[:, 0]-center[0]))]
+        quad = np.roll(quad, -np.argmin(quad.sum(axis=1)), axis=0)
+    oriented = cv2.fillConvexPoly(np.zeros_like(clipped), np.rint(quad).astype(np.int32), 255)
+    return cv2.bitwise_and(clipped, oriented), quad
+
+
 def _align_by_stone_image(frame, quad, reference, reference_mask, stone_mask, failure):
     """Use a unique, bounded image match when sparse stone features fail."""
     crop, initial = normalize(frame, quad)

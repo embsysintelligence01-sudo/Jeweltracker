@@ -1,5 +1,11 @@
 # Add this flow to your main application
 
+The integrated `jewel_tracker_5.py` uses `rub_preparation.RubCycle`: it shares
+the live INT8 stone model, derives an oriented quad from the segmentation mask,
+and uses image registration to compare before/after captures without AprilTags.
+After a new rub is confirmed, Ready and acid capture reuse its fixed box/mask. See `../README-linux.md` for that flow. The examples below describe
+the standalone marker-free adapter, which still accepts an ONNX stone model.
+
 ## Any Python GUI, API, or existing camera application
 
 Place the folder beside your application:
@@ -67,7 +73,9 @@ Wire the returned result to your own UI:
 - `result["preview"]`: normalized stone preview or diagnostic mask; it can be
   a BGR image or grayscale mask.
 - Enable the after button only after the before result is `READY`.
-- Request a new before photo on `CLEAN_THE_STONE`.
+- The reference captures starting marks without recommending a zone.
+- On `CLEAN_THE_STONE`, ask the operator to clean the stone and capture a new
+  reference. Keep rubbing/acid flow blocked until the before result is `READY`.
 - Confirm a new mark only on `NEW_RUB`; `RETAKE` has no confirmed new mask.
 
 ### Input contract
@@ -87,15 +95,17 @@ Use raw detected corners for captures, rather than smoothed display coordinates.
 
 ### Result fields
 
-Every before result contains `status`, `message`, `photo`, `preview`, `zones`,
-`recommendation`, `old_mask`, `old_mark_count`, and `coverage`.
+Every before result contains `status`, `message`, `photo`, `preview`,
+`preview_old_mask`, `old_mask`, `old_mark_count`, and `coverage`.
 
-- `status`: `READY` or `CLEAN_THE_STONE`.
-- `zones`: four `ZoneSpace` dataclasses with name, bounds, old-mark count,
-  coverage, clear-pixel count, clearance, and a usable target or `None`.
-- `recommendation`: selected `ZoneSpace` or `None`. Its `target` is `(x, y)`
-  in the normalized 512×512 before reference. Use `dataclasses.asdict()` when
-  serializing zone data.
+- `status`: `READY` or `CLEAN_THE_STONE`; invalid inputs raise a validation error.
+- The original clear-space test runs internally using a 12-pixel edge margin,
+  a 16-pixel old-mark margin, and room for a 24-pixel-radius rub in the normalized
+  reference. Its target is never displayed or returned as a recommendation.
+  `CLEAN_THE_STONE` clears any previous usable reference.
+- `preview`: plain normalized 512×512 reference, with no grid or recommendation.
+- `preview_old_mask`: normalized starting-mark mask, available for an optional
+  development overlay. Hiding the overlay must not change `old_mask` or detection.
 
 Every after result contains `status`, `message`, `photo`, `preview`, `new_mask`,
 and `locations`. After alignment it also contains `alignment`, `new_mark_count`,
@@ -111,11 +121,16 @@ and `coverage`.
   from the current full frame to the saved 512x512 before reference. The tracker
   uses it to project `new_mask` into a full-frame acid ROI.
 - Images may be `None` if no valid before reference or alignment exists.
+- `preview_old_mask`: after alignment, old marks in reference coordinates for
+  optional overlay. A successful `preview` shows the new mark in magenta.
 
 The adapter has no automatic file saving. Save images with `cv2.imwrite()` in
 your own session directory. Keep the instance between before/after calls; reset
-it for a new stone. Recommendations do not reject a valid new mark in another
-zone. This implements new-rub detection, not acid detection or material grading.
+it for a new stone. New marks can appear anywhere on the stone. A connected
+region touching the 12-pixel margin around an old mark is excluded completely.
+An unchanged stone or rubbing over old marks returns `RETAKE` with
+"No new rub detected". Alignment errors are reported separately. This implements
+new-rub detection, not acid detection or material grading.
 
 ## Reuse the existing PyQt camera worker
 
@@ -164,5 +179,5 @@ Do not open a second camera reader for the same USB device; choose the worker or
 your existing frame source.
 
 `RubCheck` and `CameraWorker` are alternative integrations: the worker retains
-the original demo implementation, and the adapter exposes the same comparison
-rules for hosts that manage their own camera and state.
+the original demo recommendations. The tracker uses the adapter, which does
+not recommend zones and strictly excludes regions touching old marks.

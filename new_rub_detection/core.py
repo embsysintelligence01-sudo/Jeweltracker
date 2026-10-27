@@ -179,15 +179,18 @@ def merged_mark_regions(mask, stone_region):
     return merged, regions, coverage
 
 
-def new_mark_regions(mask, old_mask, stone_region):
-    """Keep whole new regions; tolerate small shifts in old model masks."""
+def new_mark_regions(mask, old_mask, stone_region, *, reject_old_overlap=False):
+    """Keep new regions, with an optional strict exclusion of buffered old marks."""
     current, _, _ = merged_mark_regions(mask, stone_region)
     near_old = cv2.dilate(old_mask, np.ones((25, 25), np.uint8)) > 0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(current, 8)
     new = np.zeros_like(current)
     for index in range(1, count):
         region = labels == index
-        if np.count_nonzero(near_old & region) < 0.5 * stats[index, cv2.CC_STAT_AREA]:
+        overlap = np.count_nonzero(near_old & region)
+        is_new = (overlap == 0 if reject_old_overlap
+                  else overlap < 0.5 * stats[index, cv2.CC_STAT_AREA])
+        if is_new:
             new[region] = 255
     return new
 

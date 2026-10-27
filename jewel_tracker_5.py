@@ -15,8 +15,8 @@ Workflow:
      Switching it while connected reconnects to that feed. Settings are saved to camera.json.
      The still capture is the median of the last frames (less sensor noise in the jewel crops).
   2. Draw ROI -> left-click corners -> right-click (or "Finish ROI") to close. It must cover the
-     bench and the touchstone. Automatic stone boxes come only from newstone1.onnx, checked on
-     fresh frames at a target interval of 0.5 seconds; "Draw stone" is a manual fallback
+     bench and the touchstone. Automatic stone boxes come from INT8_openvino_model/best.xml,
+     checked continuously on fresh frames; "Draw stone" is a manual fallback
      for a stone that can't be found. Both are saved to zones.json.
   3. Lay all jewels inside the ROI, then place the touchstone. Once the stone is present and the bench
      count has been steady for AUTO_COUNT_S, one still frame is captured and analysed as in
@@ -117,7 +117,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from acid_test.integration import AcidTestThread, AcidModelCache
 from live_pipeline import InferenceDispatcher, StaleInference, LatestPreview
 from stone_onnx import StoneOnnxModel
-from rub_preparation import RubPhotoModels, RubCycle, draw_acid_roi
+from rub_preparation import RubPhotoModels, RubCycle, StoneCleanup, draw_acid_roi, render_rub_preview
+from auto_testing import StoneSettling
 from linux_camera_controls import LINUX_AF_DEFAULT, apply_linux_antiflicker
 
 # OpenCV's Linux wheel sets paths to its own Qt plugins during import. The
@@ -213,11 +214,10 @@ MERGE_GAP_PX = 40          # detections whose masks come this close are pieces o
 SHOW_REJECTED = False      # True: draw dropped (not gold) detections in dark red, for tuning
 
 # rubbing check: the visual part of R:\Rubbing_Dept_Roha\run-local4.py (no audio)
-STONE_MODEL_PATH = os.path.join(SCRIPT_DIR, "newstone1.onnx")
+STONE_MODEL_PATH = os.path.join(SCRIPT_DIR, "INT8_openvino_model", "best.xml")
 RUB_GOLD_MODEL_PATH = MODEL_PATH  # same loaded model as jewellery tracking
-# Automatic stone detection uses only the ONNX model, with confidence and ROI selection.
-STONE_CHECK_S = 0.5            # one jewellery pass now leaves CPU for moving-stone updates
-STONE_RESULT_MAX_AGE_S = 1.0  # fixed-640 CPU inference can exceed 0.5 s during rubbing
+# Automatic stone detection runs the INT8 model on each newest available frame.
+STONE_RESULT_MAX_AGE_S = 1.0   # discard delayed results during CPU contention
 STONE_CONF = 0.20              # minimum stone model confidence
 STONE_PRESENT_S = 2.5          # maximum age for a successful model observation
 RUB_GOLD_CONF = 0.15           # gold-on-stone confidence, matching bench detection
@@ -1008,7 +1008,7 @@ def largest_component(mask):
 
 
 class StoneWatcher(threading.Thread):
-    """Predict stones only with newstone1.onnx on the latest camera frame.
+    """Predict stones with the INT8 OpenVINO model on each latest camera frame.
 
     A missed, expired or failed prediction clears the automatic box. No dark
     shape search, brightness/shape validation or retained occlusion box is used.
@@ -1028,19 +1028,21 @@ class StoneWatcher(threading.Thread):
     def run(self):
         last_ts = None
         while self.running:
-            started = time.monotonic()
             frame, ts = self.grabber.latest(copy_frame=False)
             if frame is None or time.time() - ts > STONE_RESULT_MAX_AGE_S:
                 self.bbox, self.found_t = None, 0.0
-            elif ts != last_ts:
-                last_ts = ts
-                try:
-                    self.update(frame, captured_at=ts)
-                except Exception as exc:
-                    self.bbox, self.found_t = None, 0.0
-                    write_log(f"STONE ERROR  ONNX prediction failed: {exc}")
-            # Inference counts toward the interval; never queue camera frames.
-            time.sleep(max(0.005, STONE_CHECK_S - (time.monotonic() - started)))
+                time.sleep(0.005)
+                continue
+            if ts == last_ts:
+                time.sleep(0.005)  # wait only when the camera has no new frame
+                continue
+            last_ts = ts
+            try:
+                self.update(frame, captured_at=ts)
+            except Exception as exc:
+                self.bbox, self.found_t = None, 0.0
+                write_log(f"STONE ERROR  OpenVINO prediction failed: {exc}")
+            # Immediately take the newest frame; never queue frames or repeat one.
 
     def update(self, frame, captured_at=None):
         observed_at = time.time() if captured_at is None else captured_at
@@ -1272,6 +1274,7 @@ class Worker(QtCore.QThread):
         self.rub_track = None     # jewel the current rubbing is credited to
         self.rub_reference_ready = False
         self.rub_cycle_id = 0
+        self.stone_cleanup_pending = False
         try:
             self.id_model = JewelIdModel()  # per-session jewel IDs (ResNet18), trained at lock
         except Exception as e:
@@ -1299,9 +1302,10 @@ class Worker(QtCore.QThread):
             else:
                 setattr(self, kind, to_poly(pts))
 
-    def invalidate_rub_reference(self):
+    def invalidate_rub_reference(self, keep_cycle=False):
         self.rub_reference_ready = False
-        self.rub_cycle_id += 1
+        if not keep_cycle:
+            self.rub_cycle_id += 1
         self.rub_track = None
         for tr in self.tracks:
             if not tr.rubbed:
@@ -1328,6 +1332,7 @@ class Worker(QtCore.QThread):
         self.jewel_table.emit([])
         with self.lock:
             self.tracks, self.stable, self.mode = [], 0.0, "ARMING"
+            self.stone_cleanup_pending = False
             self.invalidate_rub_reference()
             self.flow_revision += 1
             self.preview.clear()
@@ -1372,9 +1377,9 @@ class Worker(QtCore.QThread):
         stone_model = None
         try:
             stone_model = StoneOnnxModel(STONE_MODEL_PATH)
-            self.event.emit("Stone: newstone1.onnx | OpenVINO CPU, float32, 2 threads", "info")
+            self.event.emit("Stone: INT8_openvino_model/best.xml | OpenVINO CPU, INT8, 640, 2 threads, continuous", "info")
         except Exception as e:
-            self.event.emit(f"Stone ONNX model unavailable: {e}", "alert")
+            self.event.emit(f"Stone INT8 OpenVINO model unavailable: {e}", "alert")
         if not self.running:
             model.close()
             return
@@ -2052,7 +2057,7 @@ class Worker(QtCore.QThread):
             self.acid_token = None
             self.rubber.active = False
             tr.rub_img = self.rub_spot_image(ev)
-            self.event.emit(f"J{tr.id} RUBBED: remove the jewel/hands, then click Start acid test for J{tr.id}", "info")
+            self.event.emit(f"J{tr.id} RUBBED: return it to the bench, outside the stone, and let it settle for testing", "info")
             self.emit_jewel_table()
 
     def rub_spot_image(self, ev):
@@ -2177,9 +2182,9 @@ class Worker(QtCore.QThread):
             target = getattr(tr, 'new_rub_target', None)
             if target is None:
                 raise RuntimeError("Confirm the new rubbed mask before starting acid verification")
-            stone = self.stone_box()
-            if stone is None or not tr.rub_boxes:
-                raise RuntimeError("The stone and this jewel's rub streak must be visible")
+            stone = target.stone  # verified by the Start capture, even if the live detector misses
+            if stone is None:
+                raise RuntimeError("A confirmed stone snapshot is required")
             if self.grabber is None:
                 raise RuntimeError("Camera is unavailable")
             latest_frame, latest_ts = self.grabber.latest()
@@ -2223,10 +2228,11 @@ class Worker(QtCore.QThread):
             tr.acid_result = record
             tr.acid_done, tr.acid_box = True, tuple(record['detector_bbox'])
             self.acid_pending_id = self.acid_token = None
+            self.stone_cleanup_pending = True
             self.invalidate_rub_reference()
             prediction = record['prediction']
             label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INCONCLUSIVE'}[prediction['prediction']]
-            self.event.emit(f"J{tr.id}: {label} ({prediction['confidence']:.1%}). Wait for the next rubbing reference", "info")
+            self.event.emit(f"J{tr.id}: {label} ({prediction['confidence']:.1%}). Clean and dry the stone; its next reference will be captured automatically", "info")
             self.emit_jewel_table()
             return True
 
@@ -2308,12 +2314,14 @@ class Worker(QtCore.QThread):
         if self.roi is not None:
             cv2.polylines(vis, [self.roi], True, ROI_COLOR, 2)
         stone = self.stone_box()
-        if stone is not None:
-            cv2.rectangle(vis, stone[:2], stone[2:], STONE_COLOR, 2)
-            cv2.putText(vis, "STONE", (stone[0] + 5, stone[1] + 22), FONT, 0.7, STONE_COLOR, 2)
         pending = next((tr for tr in self.tracks if tr.id == self.acid_pending_id), None)
         roi_mask = getattr(pending, 'acid_roi_mask', None)
         roi_stone = getattr(pending, 'acid_roi_stone', None)
+        if roi_stone is not None and getattr(pending, "new_rub_target", None) is not None:
+            stone = roi_stone  # keep the confirmed region through hand/model interference
+        if stone is not None:
+            cv2.rectangle(vis, stone[:2], stone[2:], STONE_COLOR, 2)
+            cv2.putText(vis, "STONE", (stone[0] + 5, stone[1] + 22), FONT, 0.7, STONE_COLOR, 2)
         if (roi_mask is not None and roi_mask.shape == vis.shape[:2] and stone is not None
                 and roi_stone is not None and box_iou(stone, roi_stone) >= .95):
             draw_acid_roi(vis, roi_mask)
@@ -2487,9 +2495,17 @@ class MainWindow(QtWidgets.QWidget):
         self.rub_models = RubPhotoModels()
         self.rub_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rub-photos')
         self.rub_job = self.rub_cycle = self.rub_cycle_key = None
+        self.rub_cleanup = None
+        self.rub_display_result = None
+        self.auto_gate = self.auto_gate_key = self.auto_hold = None
+        self.chk_auto_test = QtWidgets.QCheckBox("Automatic tests (ON)")
+        self.chk_auto_test.setChecked(True)
+        self.chk_auto_test.setToolTip("Return the rubbed jewel to the bench and keep it and the stone settled for 2 seconds. pH runs first when ON; Ready follows automatically.")
         self.btn_rub_reference = QtWidgets.QPushButton("Capture / retake rubbing reference")
-        self.rub_instruction = QtWidgets.QLabel("Waiting for a visible stone to recommend a clear rubbing area.")
+        self.rub_instruction = QtWidgets.QLabel("Waiting for a visible stone to capture its starting marks.")
         self.rub_instruction.setWordWrap(True)
+        self.chk_existing_rub_marks = QtWidgets.QCheckBox("Show existing rub marks (OFF)")
+        self.chk_existing_rub_marks.setToolTip("Show green starting-mark overlays for development. Detection stays active when hidden.")
         self.rub_preview = QtWidgets.QLabel("Before / after rubbing")
         self.rub_preview.setAlignment(QtCore.Qt.AlignCenter)
         self.rub_preview.setMinimumHeight(160)
@@ -2550,7 +2566,9 @@ class MainWindow(QtWidgets.QWidget):
         side.addWidget(self.btn_reset)
         side.addWidget(self.btn_rub_reference)
         side.addWidget(self.rub_instruction)
+        side.addWidget(self.chk_existing_rub_marks)
         side.addWidget(self.rub_preview)
+        side.addWidget(self.chk_auto_test)
         side.addWidget(self.chk_ph_verification)
         side.addWidget(self.acid_duration)
         side.addWidget(self.acid_grade)
@@ -2590,7 +2608,9 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_clear.clicked.connect(self.clear_zones)
         self.btn_reset.clicked.connect(self.rearm)
         self.btn_rub_reference.clicked.connect(lambda: self.capture_rub_reference(manual=True))
+        self.chk_auto_test.toggled.connect(self.auto_test_changed)
         self.chk_ph_verification.toggled.connect(self.ph_verification_changed)
+        self.chk_existing_rub_marks.toggled.connect(self.existing_rub_marks_changed)
         self.btn_start_acid.clicked.connect(self.start_acid_test)
         self.btn_stone_ready.clicked.connect(self.ready_for_stone_test)
         self.btn_cancel_acid.clicked.connect(self.cancel_acid_test)
@@ -2604,7 +2624,7 @@ class MainWindow(QtWidgets.QWidget):
         self.preview_timer.start(PREVIEW_INTERVAL_MS)
         self.rub_timer = QtCore.QTimer(self)
         self.rub_timer.timeout.connect(self.rub_guidance_tick)
-        self.rub_timer.start(500)
+        self.rub_timer.start(200)
         self.preview_key = None
         self.set_running(False)
         loaded = [self.ZONE_NAMES[k] for k in ("roi", "stone") if self.zones[k]]
@@ -2935,19 +2955,38 @@ class MainWindow(QtWidgets.QWidget):
         if key != self.rub_cycle_key:
             self.rub_cycle_key = key
             self.rub_cycle = RubCycle(self.rub_models) if key is not None else None
+            self.rub_cleanup = (StoneCleanup(self.rub_models, self.acid_models)
+                                if self.worker is not None and self.worker.stone_cleanup_pending else None)
+            self.auto_gate = self.auto_gate_key = self.auto_hold = None
+            self.rub_display_result = None
             self.rub_preview.clear()
-            self.rub_instruction.setText("Keep hands and jewellery off the stone while its reference is captured.")
+            self.rub_instruction.setText(
+                "Clean and dry the stone, then uncover it. Waiting to save the next reference."
+                if self.rub_cleanup is not None else
+                "Keep hands and jewellery off the stone while its reference is captured.")
         return self.rub_cycle
 
     def show_rub_result(self, result):
         self.rub_instruction.setText(result['message'])
-        image = result.get('preview')
-        if image is not None:
-            if image.ndim == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-            pix = QtGui.QPixmap.fromImage(to_qimage(image))
-            self.rub_preview.setPixmap(pix.scaled(480, 200, QtCore.Qt.KeepAspectRatio,
-                                                 QtCore.Qt.SmoothTransformation))
+        self.rub_display_result = result
+        self.refresh_rub_preview()
+
+    def existing_rub_marks_changed(self, enabled):
+        self.chk_existing_rub_marks.setText(f"Show existing rub marks ({'ON' if enabled else 'OFF'})")
+        self.refresh_rub_preview()
+
+    def refresh_rub_preview(self):
+        result = self.rub_display_result
+        if result is None:
+            self.rub_preview.clear()
+            return
+        image = render_rub_preview(result, self.chk_existing_rub_marks.isChecked())
+        if image is None:
+            self.rub_preview.clear()
+            return
+        pix = QtGui.QPixmap.fromImage(to_qimage(image))
+        self.rub_preview.setPixmap(pix.scaled(480, 200, QtCore.Qt.KeepAspectRatio,
+                                             QtCore.Qt.SmoothTransformation))
 
     def rub_guidance_tick(self):
         job = self.rub_job
@@ -2958,50 +2997,142 @@ class MainWindow(QtWidgets.QWidget):
             if valid:
                 try:
                     value = job['future'].result()
-                    if job['kind'] == 'before':
+                    if job['kind'] in ('before', 'cleanup'):
                         self.show_rub_result(value)
                         with self.worker.lock:
                             self.worker.rub_reference_ready = value['status'] == 'READY'
-                        self.add_log(value['message'], 'info')
+                            if job['kind'] == 'cleanup' and value['status'] == 'READY':
+                                self.worker.stone_cleanup_pending = False
+                        if value['status'] != 'WAIT_FOR_CLEANUP':
+                            self.add_log(value['message'], 'info')
                     else:
                         result, target = value
                         self.worker.set_new_rub_target(job['jewel_id'], target)
                         self.show_rub_result(result)
                         self.add_log(f"J{job['jewel_id']}: new-rub mask confirmed; acid must be inside its ROI", 'info')
-                        self.launch_acid_test(job['ph_enabled'], job['duration'], job['grade'])
+                        self.launch_acid_test(job['ph_enabled'], job['duration'], job['grade'], auto_test=job.get('auto_test', False))
                 except Exception as exc:
+                    if job['kind'] == 'cleanup' and self.rub_cleanup is not None:
+                        self.rub_cleanup.waiting("Cleanup check could not complete; waiting to retry.")
                     self.rub_instruction.setText(str(exc))
                     self.add_log(f"Rubbing photo check: {exc}", 'info')
             self.refresh_acid_controls()
         cycle = self.sync_rub_cycle()
         worker = self.worker
-        if (cycle is not None and self.rub_job is None and self.acid_thread is None
+        if (worker is not None and worker.stone_cleanup_pending
+                and self.rub_job is None and self.acid_thread is None):
+            self.capture_cleanup_reference()
+        elif (cycle is not None and self.rub_job is None and self.acid_thread is None
                 and not cycle.attempted and worker.acid_pending_id is None
                 and worker.grabber is not None and worker.stone_box() is not None):
             self.capture_rub_reference()
+        self.auto_test_tick()
 
     def capture_rub_reference(self, manual=False):
         worker = self.worker
         if (worker is None or self.rub_job is not None or self.acid_thread is not None
                 or worker.acid_pending_id is not None or worker.grabber is None):
             return
+        if worker.stone_cleanup_pending:
+            self.rub_instruction.setText("Finish cleaning and uncover the stone. Its reference will be captured automatically.")
+            return
         if manual:
             with worker.lock:
-                worker.invalidate_rub_reference()
+                worker.invalidate_rub_reference(keep_cycle=True)
         cycle = self.sync_rub_cycle()
         frame, ts = worker.grabber.latest()
         if frame is None or time.time()-ts > STREAM_TIMEOUT_S or worker.stone_box() is None:
             self.rub_instruction.setText("Expose the stone and restore a fresh camera frame before capturing.")
             return
+        if worker.stone is not None and worker.stone.model is not None:
+            self.rub_models.use_stone_model(worker.stone.model, worker.roi)
         cycle.attempted = True
-        self.rub_instruction.setText("Analyzing old marks and Z1-Z4. Keep the stone clear; wait for rubbing guidance.")
+        self.rub_instruction.setText("Saving the starting marks. Keep hands and jewellery off the stone.")
         self.rub_job = dict(kind='before', owner=worker, key=self.current_rub_key(),
                             future=self.rub_pool.submit(cycle.before, frame))
+        self.refresh_acid_controls()
+
+    def capture_cleanup_reference(self):
+        worker, cleanup, cycle = self.worker, self.rub_cleanup, self.rub_cycle
+        if (worker is None or cleanup is None or cycle is None or worker.grabber is None
+                or self.rub_job is not None or self.acid_thread is not None):
+            return
+        frame, ts = worker.grabber.latest()
+        if frame is None or not 0 <= time.time()-ts <= .75:
+            self.rub_instruction.setText("Waiting for fresh camera frames after cleaning.")
+            cleanup.waiting(self.rub_instruction.text())
+            self.refresh_acid_controls()
+            return
+        if cleanup.last_ts is not None and ts <= cleanup.last_ts:
+            return
+        if worker.stone is not None and worker.stone.model is not None:
+            self.rub_models.use_stone_model(worker.stone.model, worker.roi)
+        self.rub_job = dict(kind='cleanup', owner=worker, key=self.current_rub_key(),
+                            future=self.rub_pool.submit(lambda image: cleanup.before(cycle, image, ts), frame))
         self.refresh_acid_controls()
 
     def new_rub_target_ready(self, payload):
         if self.current_acid_payload(payload):
             self.worker.update_acid_target(payload)
+
+    def auto_test_changed(self, enabled):
+        self.chk_auto_test.setText("Automatic tests (ON)" if enabled else "Automatic tests (OFF)")
+        self.auto_gate = self.auto_gate_key = self.auto_hold = None
+        if enabled:
+            self.acid_error_message = None
+        self.refresh_acid_controls()
+
+    def auto_test_tick(self):
+        worker, cycle = self.worker, self.rub_cycle
+        if (not self.chk_auto_test.isChecked() or worker is None or cycle is None
+                or self.rub_job is not None or self.acid_thread is not None
+                or worker.mode != "LOCKED" or not worker.rub_reference_ready
+                or worker.acid_pending_id is None or worker.acid_token is not None):
+            return
+        key = (self.current_rub_key(), worker.acid_pending_id)
+        if self.auto_hold == key:
+            return
+        with worker.lock:
+            tr = next((tr for tr in worker.tracks if tr.id == worker.acid_pending_id), None)
+            if tr is None or not tr.rubbed or tr.acid_done:
+                return
+            center = getattr(tr, 'pos', None)
+            center = None if center is None else np.asarray(center, float).copy()
+            detected = getattr(tr, 'det_seen', 0.)
+            box = getattr(tr, 'det_box', None)
+            state = getattr(tr, 'state', None)
+            target = getattr(tr, 'new_rub_target', None)
+            stone = target.stone if target is not None else cycle.stone
+            stone_visible = target is not None or worker.stone_box() is not None
+            roi = None if worker.roi is None else worker.roi.copy()
+        if stone is None or worker.grabber is None:
+            return
+        frame, ts = worker.grabber.latest()
+        if frame is None or not 0 <= time.time()-ts <= .75:
+            return
+        visible = (center is not None and state == "OK" and 0 <= time.time()-detected <= .75)
+        if visible:
+            x, y = map(float, center)
+            visible = not (stone[0] <= x <= stone[2] and stone[1] <= y <= stone[3])
+            if roi is not None and cv2.pointPolygonTest(roi, (x, y), False) < 0:
+                visible = False
+        if self.auto_gate_key != key:
+            if not visible or not stone_visible:
+                self.acid_instruction.setText(f"J{worker.acid_pending_id}: return this jewel to the bench and keep the stone visible. Acid OFF.")
+                return
+            tolerance = 8. if box is None else max(6., .03*np.linalg.norm(np.asarray(box[2:])-box[:2]))
+            self.auto_gate = StoneSettling(stone, center_tolerance=tolerance)
+            self.auto_gate_key = key
+        if self.auto_gate.update(frame, ts, visible=visible and stone_visible, center=center):
+            self.add_log(f"J{worker.acid_pending_id} returned; jewel and stone settled for 2 seconds. Starting automatic test.", "info")
+            self.start_acid_test(automatic=True)
+        elif not self.auto_gate.latched:
+            message = (f"J{worker.acid_pending_id}: return this jewel to the bench, outside the stone."
+                       if not visible else
+                       f"J{worker.acid_pending_id}: settling {self.auto_gate.elapsed:.1f}/2.0 s; keep jewel and stone still.")
+            self.acid_instruction.setText(message + " Acid OFF.")
+        else:
+            self.acid_instruction.setText("The automatic photo check needs a retry. Clear the stone and move/return the jewel to retry automatically, or use Start.")
 
     def ph_verification_changed(self, enabled):
         self.chk_ph_verification.setText("pH verification (ON)" if enabled else "pH verification (OFF)")
@@ -3009,10 +3140,12 @@ class MainWindow(QtWidgets.QWidget):
 
     def refresh_acid_controls(self):
         pending = self.worker.acid_pending_id if self.worker else None
-        busy = self.acid_thread is not None or self.rub_job is not None
+        busy = self.acid_thread is not None or (
+            self.rub_job is not None and self.rub_job['kind'] != 'cleanup')
         self.btn_start_acid.setText(f"Start acid test for J{pending}" if pending is not None else "Rub a jewel to enable acid test")
         self.btn_start_acid.setEnabled(pending is not None and not busy)
-        self.btn_rub_reference.setEnabled(self.worker is not None and pending is None and not busy)
+        cleaning = self.worker is not None and self.worker.stone_cleanup_pending
+        self.btn_rub_reference.setEnabled(self.worker is not None and pending is None and not busy and not cleaning)
         waiting = (busy and self.worker is not None and self.acid_owner is self.worker
                    and self.acid_ui_token == self.worker.acid_token
                    and self.acid_logged_phase == 'WAIT_FOR_STONE_READY')
@@ -3022,21 +3155,35 @@ class MainWindow(QtWidgets.QWidget):
         self.acid_duration.setEnabled(not busy)
         self.acid_grade.setEnabled(not busy)
         self.chk_ph_verification.setEnabled(not busy)
-        if pending is not None and not busy and self.acid_error_message:
+        self.chk_auto_test.setEnabled(not busy)
+        if cleaning:
+            self.acid_instruction.setText("Next jewel paused: " + self.rub_instruction.text())
+        elif pending is not None and not busy and self.acid_error_message:
             self.acid_instruction.setText(self.acid_error_message)
         elif pending is not None and not busy:
             ph_step = "verify pH paper, then " if self.chk_ph_verification.isChecked() else ""
-            self.acid_instruction.setText(f"J{pending} rubbed. Click Start, {ph_step}click Ready for stone test. Apply acid only at NOW APPLY ACID.")
+            if self.chk_auto_test.isChecked():
+                if self.auto_hold == (self.current_rub_key(), pending):
+                    self.acid_instruction.setText(f"Automatic testing paused for J{pending}. Use Start to retry, or switch Automatic tests OFF and ON to resume.")
+                else:
+                    self.acid_instruction.setText(f"J{pending} rubbed. Return it to the bench and keep it and the stone still for 2 seconds; testing starts automatically. Acid OFF.")
+            else:
+                self.acid_instruction.setText(f"J{pending} rubbed. Click Start, {ph_step}click Ready for stone test. Apply acid only at NOW APPLY ACID.")
         elif not busy and self.worker is not None and not self.worker.rub_reference_ready:
-            self.acid_instruction.setText("Wait for the before-rubbing reference and blue target. Keep acid OFF the stone.")
+            if self.rub_display_result is not None and self.rub_display_result['status'] == 'CLEAN_THE_STONE':
+                self.acid_instruction.setText(self.rub_display_result['message'])
+            else:
+                self.acid_instruction.setText("Wait for the before-rubbing reference. Keep acid OFF the stone.")
         elif not busy:
-            self.acid_instruction.setText("Rub a jewel in the suggested clear area. " + (
+            self.acid_instruction.setText("Rub a jewel on the stone. " + (
                 "Verify fresh pH paper for every jewel." if self.chk_ph_verification.isChecked() else "pH verification is OFF."))
 
-    def start_acid_test(self):
+    def start_acid_test(self, automatic=False):
         if self.worker is None or self.acid_thread is not None or self.rub_job is not None:
             return
         worker = self.worker
+        if not automatic:
+            self.auto_hold = None
         tr = next((tr for tr in worker.tracks if tr.id == worker.acid_pending_id), None)
         if tr is None:
             return
@@ -3051,13 +3198,14 @@ class MainWindow(QtWidgets.QWidget):
         if frame is None or time.time()-ts > STREAM_TIMEOUT_S:
             self.rub_instruction.setText("Camera frame is unavailable; restore the feed and retry.")
             return
-        self.rub_instruction.setText("Checking the new rub mark. Keep hands/jewellery away; acid must remain OFF the stone.")
+        self.rub_instruction.setText("Checking the new rub mark. Keep hands away and acid OFF the stone.")
         self.rub_job = dict(kind='after', owner=worker, key=self.current_rub_key(), jewel_id=tr.id,
-                            ph_enabled=self.chk_ph_verification.isChecked(), duration=self.acid_duration.value(),
-                            grade=self.acid_grade.text().strip(), future=self.rub_pool.submit(cycle.after, frame))
+                            auto_test=self.chk_auto_test.isChecked(), ph_enabled=self.chk_ph_verification.isChecked(),
+                            duration=self.acid_duration.value(), grade=self.acid_grade.text().strip(),
+                            future=self.rub_pool.submit(cycle.after, frame))
         self.refresh_acid_controls()
 
-    def launch_acid_test(self, ph_enabled=None, duration=None, grade=None):
+    def launch_acid_test(self, ph_enabled=None, duration=None, grade=None, auto_test=None):
         if self.worker is None or self.acid_thread is not None:
             return
         self.acid_error_message = None
@@ -3065,9 +3213,11 @@ class MainWindow(QtWidgets.QWidget):
         try:
             context = self.worker.begin_acid_test(ph_verification_enabled=(
                 self.chk_ph_verification.isChecked() if ph_enabled is None else ph_enabled))
+            context["auto_test"] = self.chk_auto_test.isChecked() if auto_test is None else auto_test
             thread = AcidTestThread(context, self.acid_duration.value() if duration is None else duration,
                                     self.acid_grade.text().strip() if grade is None else grade, models=self.acid_models)
         except Exception as exc:
+            self.auto_hold = (self.current_rub_key(), self.worker.acid_pending_id)
             if self.worker.acid_token:
                 self.worker.fail_acid_test(self.worker.acid_token, str(exc))
             self.acid_instruction.setText(str(exc))
@@ -3129,11 +3279,12 @@ class MainWindow(QtWidgets.QWidget):
         if self.current_acid_payload(payload) and self.worker.finish_acid_test(payload):
             prediction = payload['result']['prediction']
             label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INCONCLUSIVE'}[prediction['prediction']]
-            self.acid_instruction.setText(f"J{payload['jewel_id']}: {label} ({prediction['confidence']:.1%}). Wait for the next clear-area rubbing guidance.")
+            self.acid_instruction.setText(f"J{payload['jewel_id']}: {label} ({prediction['confidence']:.1%}). Clean and dry the stone. The next reference will be captured after it is uncovered and still.")
 
     def acid_failed(self, payload):
         if self.current_acid_payload(payload):
             self.acid_logged_phase = None
+            self.auto_hold = (self.current_rub_key(), self.worker.acid_pending_id)
             self.btn_stone_ready.setEnabled(False)
             self.acid_error_message = f"J{payload['jewel_id']}: {payload['message']}. Retry when ready."
             if payload.get('traceback'):
@@ -3148,6 +3299,8 @@ class MainWindow(QtWidgets.QWidget):
             self.refresh_acid_controls()
 
     def cancel_acid_test(self):
+        if self.worker is not None and self.worker.acid_pending_id is not None:
+            self.auto_hold = (self.current_rub_key(), self.worker.acid_pending_id)
         if self.rub_job is not None:
             self.rub_job['cancelled'] = True
             self.rub_job['future'].cancel()

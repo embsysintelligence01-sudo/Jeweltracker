@@ -437,13 +437,13 @@ class ThreadFlowTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app=tracker.QtWidgets.QApplication.instance() or tracker.QtWidgets.QApplication([])
 
-    def run_thread(self, stone_getter=lambda:STONE, cancel_at_baseline=False, precolored=False, cancel_during_ph=False, confirm_ready=True, cancel_waiting=False, ph_enabled=True, cancel_when_hidden=False, lose_at_baseline=False):
+    def run_thread(self, stone_getter=lambda:STONE, cancel_at_baseline=False, precolored=False, cancel_during_ph=False, confirm_ready=True, cancel_waiting=False, ph_enabled=True, cancel_when_hidden=False, lose_at_baseline=False, auto=False):
         grabber=SimpleNamespace(latest=lambda:(FRAME.copy(),time.time()))
         stone_lost=[False]
         context=dict(jewel_id=2,token='thread-token',batch_id='thread-batch',
                      stone=STONE,streak=STREAK,grabber=grabber,
                      stone_getter=lambda:None if stone_lost[0] else stone_getter(),
-                     ph_verification_enabled=ph_enabled)
+                     ph_verification_enabled=ph_enabled, auto_test=auto)
         detector=Mock();detector.predict.return_value=([Detection(BOX,.95)],1.0)
         classifier=Mock();classifier.predict.return_value=record()['prediction']
         events,completed,failed=[],[],[]
@@ -472,7 +472,7 @@ class ThreadFlowTests(unittest.TestCase):
              patch('acid_test.integration.TemporalMobileNet',return_value=classifier), \
              patch('acid_test.integration.AcidSequence',side_effect=lambda stone,streak,duration:AcidSequence(stone,streak,.12,.1)):
             thread.start()
-            deadline=time.monotonic()+5
+            deadline=time.monotonic()+(8 if auto else 5)
             while thread.isRunning() and time.monotonic()<deadline:
                 self.app.processEvents();time.sleep(.01)
             thread.cancel()
@@ -496,6 +496,34 @@ class ThreadFlowTests(unittest.TestCase):
         self.assertLess(ordered.index('PH_VERIFIED'),ordered.index('WAIT_FOR_STONE_READY'))
         self.assertLess(ordered.index('WAIT_FOR_STONE_READY'),ordered.index('BASELINE'))
         self.assertEqual('ACIDIC_REACTION_VERIFIED',completed[0]['result']['ph_verification']['result'])
+
+    def test_automatic_ph_pass_precedes_settling_and_baseline_without_ready_click(self):
+        events, completed, failed = self.run_thread(auto=True, confirm_ready=False)
+        self.assertFalse(failed)
+        self.assertEqual(1, len(completed))
+        phases = [event['phase'] for event in events]
+        self.assertNotIn('WAIT_FOR_STONE_READY', phases)
+        self.assertLess(phases.index('PH_VERIFIED'), phases.index('AUTO_STONE_SETTLE'))
+        self.assertLess(phases.index('AUTO_STONE_SETTLE'), phases.index('BASELINE'))
+        self.assertTrue(completed[0]['result']['automatic_test'])
+
+    def test_automatic_ph_off_reaches_baseline_without_any_ready_click(self):
+        events, completed, failed = self.run_thread(auto=True, ph_enabled=False, confirm_ready=False)
+        self.assertFalse(failed)
+        self.assertEqual(1, len(completed))
+        phases = [event['phase'] for event in events]
+        self.assertIn('PH_SKIPPED', phases)
+        self.assertNotIn('PH_LOADING', phases)
+        self.assertNotIn('WAIT_FOR_STONE_READY', phases)
+        self.assertLess(phases.index('AUTO_STONE_SETTLE'), phases.index('BASELINE'))
+
+    def test_automatic_mode_cannot_enter_stone_stage_before_ph_verification(self):
+        events, completed, failed = self.run_thread(auto=True, confirm_ready=False, cancel_during_ph=True)
+        self.assertFalse(failed)
+        self.assertFalse(completed)
+        phases = [event['phase'] for event in events]
+        self.assertNotIn('AUTO_STONE_SETTLE', phases)
+        self.assertNotIn('BASELINE', phases)
 
     def test_ph_pass_does_not_start_baseline_without_operator(self):
         events,completed,failed=self.run_thread(confirm_ready=False)
@@ -597,11 +625,10 @@ class ThreadFlowTests(unittest.TestCase):
         cache.get.assert_not_called()
         self.assertIsNone(thread.ph_verification)
 
-    def test_stone_loss_fails_without_classifying(self):
+    def test_temporary_stone_model_loss_keeps_the_confirmed_capture_region(self):
         _,completed,failed=self.run_thread(lose_at_baseline=True)
-        self.assertFalse(completed)
-        self.assertEqual(1,len(failed))
-        self.assertIn('Stone moved',failed[0]['message'])
+        self.assertFalse(failed)
+        self.assertEqual(1,len(completed))
 
 
 class ModelCacheTests(unittest.TestCase):

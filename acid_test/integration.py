@@ -23,12 +23,13 @@ from acidphintegration.auto_sop import (
     AutoSOP, analyze_paper, plausible_match, PAPER_CLASS_ID, CONFIDENCE,
 )
 from acidphintegration.openvino_obb import OpenVINOOBB
+from auto_testing import StoneSettling
 
 PH_MODEL_PATH = Path(__file__).resolve().parents[1] / 'acidphintegration/acidph_openvino/acidph.xml'
 
 
 class AcidModelCache:
-    """Window-owned models: lazy initialization, one warm-up, no idle inference."""
+    """Window-owned models reused for confirmed tests and post-test cleanup."""
     def __init__(self):
         self._lock = threading.Lock()
         self._models = None
@@ -53,8 +54,8 @@ class AcidModelCache:
             if self._models is None:
                 detector = OnnxAcidDetector(DETECTOR_PATH)
                 classifier = TemporalMobileNet(latest_temporal_model_path())
-                # Synthetic warm-up only. Live frames are used after the
-                # operator starts a confirmed rubbed jewel's capture.
+                # Synthetic warm-up only. Live inference runs during a
+                # confirmed rubbed jewel's test and its cleanup handoff.
                 blank = np.zeros((320, 320, 3), dtype=np.uint8)
                 detector.predict(blank, 0.60)
                 classifier.predict([blank], [blank], [blank])
@@ -174,13 +175,17 @@ class AcidTestThread(QtCore.QThread):
             return False
         self._waiting_for_stone.set()
         try:
+            automatic = self.context.get('auto_test', False)
+            phase = 'AUTO_STONE_SETTLE' if automatic else 'WAIT_FOR_STONE_READY'
+            settling = StoneSettling(self.context['stone']) if automatic else None
             self.progress.emit(self.payload(
-                phase='WAIT_FOR_STONE_READY',
+                phase=phase,
                 message=('pH verified. ' if self.ph_verification_enabled else 'pH verification OFF. ')
-                        + 'Remove paper/hands from the stone. Click Ready for stone test when ready; keep acid OFF the stone.',
+                        + ('Remove paper/hands and keep the stone still for 2 seconds; the baseline will start automatically. Keep acid OFF.'
+                           if automatic else 'Remove paper/hands from the stone. Click Ready for stone test when ready; keep acid OFF the stone.'),
             ))
             last_ts, last_fresh, last_hidden_message = None, time.monotonic(), -1e9
-            # pH verification survives a hidden or repositioned stone.
+            # A confirmed new-rub target survives hand occlusion without live detection.
             while not self.cancelled.wait(0.1):
                 frame, ts = self.context['grabber'].latest()
                 now = time.monotonic()
@@ -191,7 +196,16 @@ class AcidTestThread(QtCore.QThread):
                 last_ts, last_fresh = ts, now
                 if frame.shape != self.ph_frame_shape:
                     raise RuntimeError('Camera resolution changed; retry the test')
-                stone = self.context['stone_getter']()
+                if automatic and not self._stone_ready.is_set():
+                    if not settling.update(frame, ts):
+                        if now-last_hidden_message >= .5:
+                            self.progress.emit(self.payload(phase=phase,
+                                message=f'Keep paper/hands away and the stone still: {settling.elapsed:.1f}/2.0 s. Acid OFF.'))
+                            last_hidden_message = now
+                        continue
+                    self._stone_ready.set()
+                target = self.context.get('rub_target')
+                stone = self.context['stone'] if target is not None else self.context['stone_getter']()
                 if stone is None:
                     self._stone_ready.clear()
                     if now-last_hidden_message >= .5:
@@ -200,7 +214,6 @@ class AcidTestThread(QtCore.QThread):
                         last_hidden_message = now
                     continue
                 if self._stone_ready.is_set():
-                    target = self.context.get('rub_target')
                     if target is not None:
                         try:
                             located = target.locate(frame)
@@ -223,6 +236,14 @@ class AcidTestThread(QtCore.QThread):
             return False
         finally:
             self._waiting_for_stone.clear()
+
+    def check_frozen_stone(self):
+        """A confirmed new-rub target owns the fixed region, independent of live boxes."""
+        if self.context.get('rub_target') is not None:
+            return
+        stone = self.context['stone_getter']()
+        if stone is not None and bbox_iou(stone, self.context['stone']) < .7:
+            raise RuntimeError('Stone moved; target retained. Repeat the acid test with a still stone')
 
     def run(self):
         try:
@@ -259,15 +280,13 @@ class AcidTestThread(QtCore.QThread):
                         return
                     frame, ts = self.context['grabber'].latest()
                     now = time.monotonic()
-                    if frame is None or ts == last_ts:
+                    if frame is None or ts == last_ts or time.time()-ts > 3:
                         if now - last_fresh > 3:
                             raise RuntimeError('Camera stream lost; acid test incomplete. Restore the camera and retry')
                         self.cancelled.wait(0.01)
                         continue
                     last_ts, last_fresh = ts, now
-                    stone = self.context['stone_getter']()
-                    if stone is None or bbox_iou(stone, self.context['stone']) < 0.7:
-                        raise RuntimeError('Stone moved or disappeared; repeat the acid test with a still stone')
+                    self.check_frozen_stone()
                     seq.push(frame, now)
                     if len(seq.observation_frames) != preview_count:
                         preview_count = len(seq.observation_frames)
@@ -287,11 +306,12 @@ class AcidTestThread(QtCore.QThread):
                     if seq.state == 'WAIT_FOR_ACID' and future is None and now - last_detection >= 0.2:
                         future = pool.submit(detector.predict, frame.copy(), 0.60)
                         last_detection = now
-                    if seq.state != last_phase or now - last_progress >= 0.1:
+                    if seq.state != 'PROCESSING' and (seq.state != last_phase or now - last_progress >= 0.1):
                         self.progress.emit(self.payload(phase=seq.state, message=seq.instruction(now)))
                         last_progress = now
                         last_phase = seq.state
                     if seq.state == 'PROCESSING':
+                        self.progress.emit(self.payload(phase='PROCESSING', message=seq.instruction(now)))
                         prediction = classifier.predict(seq.baseline_frames, seq.transition_frames, seq.observation_frames)
                         if self.cancelled.is_set():
                             return
@@ -327,6 +347,7 @@ class AcidTestThread(QtCore.QThread):
             'record_path': str(final / 'manifest.json'),
             'ph_verification': dict(self.ph_verification),
             'ph_verification_enabled': self.ph_verification_enabled,
+            'automatic_test': self.context.get('auto_test', False),
         }
         try:
             if seq.streak_mask is not None:

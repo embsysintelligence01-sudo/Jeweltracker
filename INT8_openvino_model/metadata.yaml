@@ -1,0 +1,24 @@
+description: Ultralytics YOLOv8s-seg model trained on /content/datasets/stone_all-11/data.yaml
+author: Ultralytics
+date: '2026-10-24T18:15:11.559942+05:30'
+version: 8.4.185
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: segment
+head: Segment
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: St
+args:
+  data: C:\Users\embsy\Downloads\stone_all.v11i.yolov8\data.yaml
+  batch: 1
+  fraction: 1.0
+  quantize: 8
+  nms: null
+  dynamic: false
+channels: 3
+end2end: false
