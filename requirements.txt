@@ -11,4 +11,5 @@ numpy
 onnxruntime
 openvino==2026.4.1
 Pillow
+reportlab
 onnx

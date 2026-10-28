@@ -1,55 +1,14 @@
-"""
-Jewel Guard: RTSP jewel tracking with ROI-exit / disappearance alerts and a per-jewel rubbing + acid check.
+"""Jewel Guard: continuous jewel tracking, rubbing and acid evidence capture.
 
-Install:  pip install ultralytics opencv-python PyQt5 scipy numpy onnxruntime openvino
-Run:      ./run_tracker.sh (or .venv/bin/python jewel_tracker_5.py)
-          Jewel/stone/rubbing models sit next to this script. Temporal acid
-          code and models are bundled under acid_test/. See README-linux.md.
-
-Workflow:
-  1. The camera connects on startup. The top bar picks how it is reached:
-       - Network (router/Wi-Fi): the Dahua camera's address on the LAN
-       - Direct Ethernet: the camera cabled straight into this PC's Ethernet port; camera and PC need
-         static IPs in the same subnet (this PC's Ethernet is 192.168.1.1/24, so e.g. camera 192.168.1.108)
-       - Custom URL: any RTSP URL, or 0 for a webcam
-     Switching it while connected reconnects to that feed. Settings are saved to camera.json.
-     The still capture is the median of the last frames (less sensor noise in the jewel crops).
-  2. Draw ROI -> left-click corners -> right-click (or "Finish ROI") to close. It must cover the
-     bench and the touchstone. Automatic stone boxes come from INT8_openvino_model/best.xml,
-     checked continuously on fresh frames; "Draw stone" is a manual fallback
-     for a stone that can't be found. Both are saved to zones.json.
-  3. Lay all jewels inside the ROI, then place the touchstone. Once the stone is present and the bench
-     count has been steady for AUTO_COUNT_S, one still frame is captured and analysed as in
-     SOP-monitoring-rpi / Weight-Scale-SOP: YOLO counts the jewels; each one is cut out on white from
-     the repos' Otsu jewellery mask (jewel_capture.py) and classified once with SigLIP2 and its
-     correction gallery (jewel_classifier.py), plus a closed-ring shape check for bangles. The type is
-     locked to the jewel and listed in the side panel as "J1. Chain / Necklace"; double-click to rename.
-     The live video only tracks J1..JN (no type prediction on the live video).
-  4. The only jewel alert (message + 5 s beep) is a jewel leaving the ROI ("J1 MISSING - left the ROI"):
-     its box centre is seen outside the ROI (the detector also looks OUTSIDE_MARGIN_PX past it). A jewel
-     that is merely unseen (in the hand, covered, rubbed) shows a dashed box, never an alert.
-     Detections that aren't gold-coloured (HSV check) are dropped.
-  5. Rubbing check (visual part of run-local4.py, no audio): the touchstone is found with its stone
-     model, gold on the stone with its rubbing-gold model (mask clipped to the stone, >= 50 % inside),
-     and rubbing is gold on the stone whose centroid keeps moving. Rubbing is credited to one jewel:
-     the jewel seen at the stone that moves most (movement score: rubbing jiggles it), else the tracked
-     jewel on that gold, else the jewel missing from the bench (in the hand) nearest the stone. After RUB_CONFIRM_S of rubbing that jewel is RUBBED; while it is being rubbed it shows
-     RUBBING.
-  6. IDs stay with their jewel (v4): the gold model's boxes are followed by position from frame to frame. At
-     lock a per-session ResNet18 ID model is trained in the background (~8 s) on each jewel's capture
-     crop (turned / scaled / re-lit copies; one class per jewel, plus "not a jewel" from bench and stone
-     crops). A box that stands still for STABLE_S is identified by it: a jewel put back anywhere gets its
-     ID back, and IDs swapped when jewels slid over each other are corrected. No CSRT.
-  7. Rub any untested jewel first. Once rubbing is confirmed, that jewel owns the next acid test.
-     Click Start acid test for Jn, show fresh yellow pH paper, and add acid to that
-     same paper until its pink reaction is verified using OpenVINO. Repeat for EVERY jewel
-     and retry. Remove paper/hands, click Ready for stone test, wait for the 2-second clean stone baseline,
-     and only apply acid to the streak at NOW APPLY ACID. The local acid_test package records pouring and
-     post-detection frames and runs the temporal MobileNet classifier. The same jewel's row
-     receives 22K GOLD, NON-GOLD or INCONCLUSIVE and confidence. Then rub any next jewel.
-     Capture sequences and predictions are saved locally; predictions are never ground-truth labels.
-     A jewel is DONE after its acid result is ready and it rests off the stone for DONE_SETTLE_S.
-
+Run ./run_tracker.sh. Draw the bench ROI and, optionally, the stone test-position
+ROI once. Initial IDs/crops have a two-second target. In-hand/under-hand history
+associates a rubbing cycle; a completely lost track is reported as missed.
+Timestamped frames are recorded independently of model speed. New rubbing masks
+and the acid baseline share camera frames. One acid detection triggers a
+five-second reaction window, with recorded-clip recovery for live misses.
+No Ready, Retake or Retry handoff is required. The session PDF includes actual
+acid-model output and separate tracking/rubbing evidence notes. Unsupported
+stone-risk, weight, thread and packet-sealing sections are omitted.
 """
 import math
 import os
@@ -79,7 +38,7 @@ import torch
 # (14-10 16:25) 8 threads at ~90 % each and the PC at 100 % while the jewels just lay there. So each
 # onnxruntime model gets ORT_THREADS threads that sleep when idle, and torch TORCH_THREADS.
 ORT_THREADS = 2
-JEWEL_MODEL_THREADS = 4   # the jewel model runs on every frame: it gets more
+JEWEL_MODEL_THREADS = 2   # reserve CPU for concurrent mask, acid and evidence capture
 TORCH_THREADS = 4
 torch.set_num_threads(TORCH_THREADS)
 # ultralytics resets torch to its NUM_THREADS (8 here) in select_device() on every model's first predict
@@ -119,6 +78,8 @@ from live_pipeline import InferenceDispatcher, StaleInference, LatestPreview
 from stone_onnx import StoneOnnxModel
 from rub_preparation import RubPhotoModels, RubCycle, StoneCleanup, draw_acid_roi, render_rub_preview
 from auto_testing import StoneSettling
+from continuous_testing import ContinuousMonitor, draw_workflow, PHASE_TITLES
+from session_evidence import prediction_text
 from linux_camera_controls import LINUX_AF_DEFAULT, apply_linux_antiflicker
 
 # OpenCV's Linux wheel sets paths to its own Qt plugins during import. The
@@ -166,11 +127,11 @@ CONF = 0.15
 DEVICE = "cpu"             # "cpu" for the end application; "0" would use a CUDA GPU while developing
 IMGSZ = 320
 RING_MAX_DIAMETER_PX = 150 # a closed loop smaller than this (outer diameter, px) is a finger ring
-AUTO_COUNT_S = 3.0
+AUTO_COUNT_S = 1.7  # IDs/raw crops use the remaining budget in the 2-second initial window
 CAPTURE_PRESENCE = 0.3     # a jewel counts when seen in this share of the frames of the last AUTO_COUNT_S
                            # (tiny pieces like earrings score ~0.2-0.3 and blink in and out of single frames)
 CAPTURE_STRONG = 0.6       # jewels seen this often define "steady" (a blinking earring must not hold it up)
-CAPTURE_STEADY_S = 1.0     # capture when the clearly present jewels have not changed for this long
+CAPTURE_STEADY_S = 0.3     # capture when the clearly present jewels have not changed for this long
 CAPTURE_IMGSZ = 320        # fixed input size of rojeweltrack.onnx for the still capture
 CLUSTER_PX = 40            # detections this close in different frames are the same jewel
 CLUSTER_IOU = 0.5          # ... and so are detections whose boxes overlap this much (IoU)
@@ -562,6 +523,7 @@ class RTSPGrabber(threading.Thread):
         self.af_state = {}        # the camera's own brightness, restored when anti-flicker is switched off
         self.af_busy_until = 0.0  # applying anti-flicker pauses the frames for a few seconds: not a lost stream
         self.on_af = None         # called with the read-back message after applying
+        self.on_frame = None      # non-blocking evidence recorder, independent of inference
         self.frame, self.ts = None, 0.0
         self.lock = threading.Lock()
         self.running = True
@@ -606,8 +568,11 @@ class RTSPGrabber(threading.Thread):
                 ok, f = cap.read()
                 if not ok:
                     break
+                captured_at = time.time()
+                if self.on_frame is not None:
+                    self.on_frame(f, captured_at)
                 with self.lock:
-                    self.frame, self.ts = f, time.time()
+                    self.frame, self.ts = f, captured_at
             cap.release()
             self.connected = False
             time.sleep(1)  # then reconnect
@@ -1014,9 +979,10 @@ class StoneWatcher(threading.Thread):
     shape search, brightness/shape validation or retained occlusion box is used.
     """
 
-    def __init__(self, grabber, model, roi_fn):
+    def __init__(self, grabber, model, roi_fn, min_interval=0.):
         super().__init__(daemon=True)
         self.grabber, self.model, self.roi_fn = grabber, model, roi_fn
+        self.min_interval = min_interval
         self.bbox = None
         self.found_t = 0.0
         self.running = True
@@ -1026,8 +992,11 @@ class StoneWatcher(threading.Thread):
         return self.bbox is not None and time.time() - self.found_t < STONE_PRESENT_S
 
     def run(self):
-        last_ts = None
+        last_ts, last_started = None, -1e9
         while self.running:
+            if time.monotonic()-last_started < self.min_interval:
+                time.sleep(.005)
+                continue
             frame, ts = self.grabber.latest(copy_frame=False)
             if frame is None or time.time() - ts > STONE_RESULT_MAX_AGE_S:
                 self.bbox, self.found_t = None, 0.0
@@ -1036,7 +1005,7 @@ class StoneWatcher(threading.Thread):
             if ts == last_ts:
                 time.sleep(0.005)  # wait only when the camera has no new frame
                 continue
-            last_ts = ts
+            last_ts, last_started = ts, time.monotonic()
             try:
                 self.update(frame, captured_at=ts)
             except Exception as exc:
@@ -1233,10 +1202,20 @@ class Worker(QtCore.QThread):
     jewel_table = QtCore.pyqtSignal(list)  # [(id, jewel crop, rubbed, rub spot image, acid tested, done), ...]
     event = QtCore.pyqtSignal(str, str)  # message, level: "info" | "alert"
     status = QtCore.pyqtSignal(str)
+    workflow = QtCore.pyqtSignal(object)
 
-    def __init__(self, source, roi_pts, stone_pts=None, camera=None):
+    def __init__(self, source, roi_pts, stone_pts=None, camera=None, continuous=False, test_pts=None, rub_models=None, acid_models=None):
         super().__init__()
         self.source = source
+        self.continuous_enabled = continuous
+        self.test_roi = to_poly(test_pts)
+        self.continuous_monitor = None
+        self.continuous_pending_id = None
+        self.continuous_target_uncertain = False
+        self.continuous_cycle_id = None
+        self.continuous_stage = dict(phase='WAIT_FOR_STONE', message='Waiting for before-stone capture.')
+        self.continuous_acid = self.continuous_mask = None
+        self.rub_models, self.acid_models = rub_models, acid_models
         self.running = True
         self.lock = threading.Lock()
         self.roi = to_poly(roi_pts)
@@ -1276,7 +1255,7 @@ class Worker(QtCore.QThread):
         self.rub_cycle_id = 0
         self.stone_cleanup_pending = False
         try:
-            self.id_model = JewelIdModel()  # per-session jewel IDs (ResNet18), trained at lock
+            self.id_model = None if continuous else JewelIdModel()  # continuous mode uses hand-history association
         except Exception as e:
             self.id_model = None
             print(f"[jewel ID model] not available: {e}")
@@ -1299,6 +1278,8 @@ class Worker(QtCore.QThread):
             self.invalidate_rub_reference()
             if kind == "stone":
                 self.set_stone(pts)
+            elif kind == "test":
+                self.test_roi = to_poly(pts)
             else:
                 setattr(self, kind, to_poly(pts))
 
@@ -1347,6 +1328,8 @@ class Worker(QtCore.QThread):
 
     def stop(self):
         self.running = False
+        if self.continuous_monitor is not None:
+            self.continuous_monitor.stop()
         if self.grabber is not None:
             self.grabber.stop()
         for watcher in (self.stone,):
@@ -1385,9 +1368,18 @@ class Worker(QtCore.QThread):
             return
         grabber = self.grabber = RTSPGrabber(self.source, self.camera)
         grabber.on_af = self.antiflicker_applied
+        if self.continuous_enabled:
+            if stone_model is not None:
+                self.rub_models.use_stone_model(stone_model, self.roi)
+            directory = os.path.join(CAPTURE_DIR, 'sessions', time.strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:8])
+            self.continuous_monitor = ContinuousMonitor(directory, self.continuous_snapshot,
+                self.rub_models, self.acid_models, self.continuous_event, rub_observer=self.recorded_rub_evidence)
+            grabber.on_frame = self.continuous_monitor.journal.offer
+            self.continuous_monitor.start()
         grabber.start()
         try:
-            self.stone = StoneWatcher(grabber, stone_model, lambda: self.roi)
+            self.stone = StoneWatcher(grabber, stone_model, lambda: self.roi,
+                                      min_interval=.2 if self.continuous_enabled else 0.)
             self.stone.start()
             self.rubber = RubbingObserver(self.stone_box, generation_fn=lambda: self.flow_revision)
             last_ts, fps, t_prev = 0.0, 0.0, time.time()
@@ -1441,7 +1433,7 @@ class Worker(QtCore.QThread):
                     self.rejected = rejected
                     if not skip:
                         self.rubber.active = (self.mode == "LOCKED" and self.acid_pending_id is None
-                                              and self.rub_reference_ready)
+                                              and (self.rub_reference_ready or self.continuous_enabled))
                         polys, confs = self.gold_observation
                         self.rubber.observe(polys, confs, frame.shape, ts, captured_stone, revision)
                     if self.mode == "ARMING":
@@ -1478,7 +1470,115 @@ class Worker(QtCore.QThread):
             for watcher in (self.stone, grabber, self.id_training_thread):
                 if watcher is not None and watcher.is_alive():
                     watcher.join()
+            if self.continuous_monitor is not None:
+                self.continuous_monitor.stop()
+                self.continuous_monitor.join()
             model.close()
+
+    def recorded_rub_evidence(self, frame, stone):
+        result = self.model.predict(frame, conf=RUB_GOLD_CONF, device=DEVICE, verbose=False,
+                                    _live_job='recovery')[0]
+        if result.boxes is None or result.masks is None:
+            return None
+        ev = rubbing_evidence(result.masks.xy, result.boxes.conf.cpu().numpy(), frame.shape, stone)
+        if ev is None:
+            return None
+        ox, oy = ev['origin']
+        crop = frame[oy:oy+ev['mask'].shape[0], ox:ox+ev['mask'].shape[1]]
+        fraction = gold_fraction(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), ev['mask'])
+        return ev if fraction is not None and fraction >= .35 else None
+
+    def continuous_snapshot(self):
+        grabber = self.grabber
+        if grabber is None:
+            return None
+        frame, ts = grabber.latest(copy_frame=False)
+        if frame is None or time.time()-ts > STREAM_TIMEOUT_S:
+            return None
+        with self.lock:
+            return dict(frame=frame, timestamp=ts, mode=self.mode, revision=self.flow_revision,
+                stone=self.stone_box(), placement=self.test_roi,
+                rubbing=bool(self.rubbing_now and self.rubber is not None and 0 <= ts-self.rubber.ts < RUB_GAP_S), bench_moving=bool(getattr(self, 'moving_now', False)),
+                tracks=[dict(id=tr.id, state=tr.state, spot=tr.spot, det_seen=tr.det_seen,
+                    pos=tr.pos.copy(), box=np.asarray(tr.det_box).copy(), in_hand=getattr(tr, 'in_hand', False),
+                    thumb=getattr(tr, 'thumb', None),
+                    acid_done=tr.acid_done or getattr(tr, 'test_captured', False)) for tr in self.tracks])
+
+    def continuous_event(self, kind, **payload):
+        if kind in ('status', 'report'):
+            self.workflow.emit(dict(kind=kind, **payload))
+            return
+        with self.lock:
+            tr = next((tr for tr in self.tracks if tr.id == payload.get('jewel_id')), None)
+            if kind == 'placement':
+                self.test_roi = np.asarray(payload['roi'], np.int32)
+            elif kind == 'begin':
+                self.continuous_pending_id = payload['jewel_id']
+                self.continuous_cycle_id = payload['token']
+                self.continuous_acid = self.continuous_mask = None
+                if tr is not None:
+                    tr.continuous_token = payload['token']
+                    tr.acid_result = dict(prediction=None, rubbing_status='Recording', record_path='')
+            elif kind == 'phase':
+                if payload.get('token') != self.continuous_cycle_id:
+                    return
+                self.continuous_stage = dict(payload)
+            elif kind == 'reference':
+                if self.continuous_cycle_id is None:
+                    self.continuous_mask = self.continuous_acid = None
+            elif kind in ('mask', 'target'):
+                if payload['token'] != self.continuous_cycle_id:
+                    return
+                self.continuous_target_uncertain = payload.get('uncertain', False)
+                if payload.get('mask') is not None:
+                    self.continuous_mask = dict(mask=payload['mask'], stone=payload['stone'])
+                    if tr is not None:
+                        tr.acid_roi_mask, tr.acid_roi_stone = payload['mask'], payload['stone']
+                if kind == 'mask' and tr is not None:
+                    tr.rub_img = payload['photo']
+            elif kind == 'clear_mask':
+                if payload['token'] != self.continuous_cycle_id:
+                    return
+                self.continuous_mask = None
+                if tr is not None:
+                    tr.acid_roi_mask = tr.acid_roi_stone = None
+                self.continuous_target_uncertain = True
+            elif kind in ('acid_detection', 'mask_decision', 'baseline'):
+                if payload['token'] != self.continuous_cycle_id:
+                    return
+                if kind == 'acid_detection':
+                    self.continuous_acid = dict(payload)
+                elif kind == 'baseline' and tr is not None:
+                    tr.acid_crop = payload['photo']
+            elif kind == 'captured':
+                if payload['token'] != self.continuous_cycle_id:
+                    return
+                if tr is not None:
+                    tr.test_captured = True
+                self.continuous_pending_id = self.continuous_cycle_id = None
+            elif kind == 'result':
+                record = payload['record']
+                tr = next((tr for tr in self.tracks if tr.id == record['jewel_id']), None)
+                if tr is not None:
+                    tr.acid_result = record
+                    tr.acid_done = record.get('capture_complete', False)
+                    tr.done = tr.acid_done and record.get('prediction') is not None
+                    tr.rubbed = record['rubbing_status'] != 'UNCONFIRMED'
+                    if record.get('mask_image'):
+                        tr.rub_img = cv2.imread(record['mask_image'])
+                    if record.get('acid_image'):
+                        tr.acid_crop = cv2.imread(record['acid_image'])
+                self.event.emit(('J'+str(record['jewel_id']) if record['jewel_id'] is not None else 'Unassigned jewel')
+                                + ': '+prediction_text(record.get('prediction'))+'. Evidence saved to PDF.'
+                                + (' '+record['prediction']['invalid_reason'] if record.get('prediction') and record['prediction'].get('invalid_reason') else '')
+                                + (' WARNING: acid and new rubbing are at different locations.' if record.get('acid_target_status') == 'ACID_AT_DIFFERENT_LOCATION' else '')
+                                + (' WARNING: new rubbing overlaps previous acid.' if record.get('rub_previous_acid_overlap', 0) > 0 else '')
+                                + (' WARNING: jewel association is unverified after another jewel was handled.' if record.get('acid_jewel_association') == 'UNVERIFIED_MULTIPLE_JEWELS' else ''), 'info')
+            payload['completed'] = [tr.id for tr in self.tracks if tr.done]
+            if kind not in ('target', 'phase', 'acid_detection', 'reference'):
+                self.emit_jewel_table()
+        if kind != 'target':
+            self.workflow.emit(dict(kind=kind, **payload))
 
     def detect(self, model, frame, roi, imgsz=None, captured_at=None):
         """One unmodified full-frame prediction; ROI filtering happens afterward.
@@ -1576,6 +1676,9 @@ class Worker(QtCore.QThread):
         # the jewels present over the last AUTO_COUNT_S, not one frame: a tiny piece may blink out of the
         # frame that happens to be captured
         if self.arm_start is None:
+            if not start:
+                self.arm_count = 0
+                return
             self.arm_start = t
         self.arm_frames.append((t, start))
         while t - self.arm_frames[0][0] > AUTO_COUNT_S:
@@ -1587,14 +1690,24 @@ class Worker(QtCore.QThread):
         filled = min(1.0, (t - self.arm_start) / AUTO_COUNT_S)
         steady = min(1.0, (t - self.persist_since) / CAPTURE_STEADY_S)
         self.stable = min(filled, steady)
-        if frame is None or not seen or self.stable < 1.0:
+        deadline = self.continuous_enabled and t-self.arm_start >= 1.8
+        if frame is None or not seen or (self.stable < 1.0 and not deadline):
             return
-        jewels = self.capture(self.still_frame(frame), seen)
+        if self.continuous_enabled:
+            # Include a newly laid jewel visible now, even if it has not occupied
+            # 30% of the counting history. Never wait for a sharper second pass.
+            seen = list(seen)
+            for det in start:
+                if not any(np.linalg.norm(det.c-old.c) <= CLUSTER_PX or box_iou(det.box, old.box) >= CLUSTER_IOU for old in seen):
+                    seen.append(det)
+        jewels = self.capture(frame if self.continuous_enabled else self.still_frame(frame), seen)
         if not jewels:
             self.arm_frames.clear()
             self.arm_start = self.persist_key = None
             return
         self.lock_jewels(jewels, t, frame)
+        if self.continuous_enabled:
+            self.event.emit(f"Initial IDs/crops ready after {time.time()-self.arm_start:.2f} s (2 s target)", "info")
 
     def lock_jewels(self, jewels, t, frame=None):
         """jewels: [(det, item, label, confidence)] from the capture -> tracks J1..JN with their locked type."""
@@ -1607,6 +1720,8 @@ class Worker(QtCore.QThread):
             if tr.thumb is None and frame is not None:
                 tr.thumb = crop_box(frame, d.box).copy()
         self.mode = "LOCKED"
+        if self.continuous_enabled:
+            self.rub_reference_ready = True
         self.event.emit(f"Locked {len(jewels)} jewel(s)", "info")
         self.emit_jewel_list()
         if self.rubber is not None and self.stone_box() is None:
@@ -1615,12 +1730,12 @@ class Worker(QtCore.QThread):
     def learn_ids(self, frame):
         """Train the per-session ID model from the jewels as captured (in the background, a few seconds)."""
         crops = {tr.id: crop_box(frame, tr.box).copy() for tr in self.tracks}
-        negatives = self.negative_crops(frame)
         self.id_model.ready = False
 
         def train():
             t0 = time.time()
             try:
+                negatives = self.negative_crops(frame)
                 acc = self.id_model.train(crops, negatives)
                 self.event.emit(f"Jewel IDs learned (ResNet18, {len(crops)} jewels + bench/stone, "
                                 f"{time.time() - t0:.0f} s, self-check {acc:.0%})", "info")
@@ -1667,7 +1782,7 @@ class Worker(QtCore.QThread):
     def emit_jewel_table(self):
         """Status table: updated when a jewel is locked, renamed, rubbed, acid tested or DONE."""
         self.jewel_table.emit([(tr.id, getattr(tr, "thumb", None), tr.rubbed, getattr(tr, "rub_img", None),
-                                tr.acid_done, tr.done, tr.acid_result, tr.id == self.acid_pending_id, getattr(tr, "acid_crop", None))
+                                tr.acid_done, tr.done, tr.acid_result, tr.id in (self.acid_pending_id, self.continuous_pending_id), getattr(tr, "acid_crop", None))
                                for tr in sorted(self.tracks, key=lambda x: x.id)])
 
     def persistent_jewels(self):
@@ -1713,7 +1828,7 @@ class Worker(QtCore.QThread):
         correction gallery, plus a closed-ring shape check for bangles / finger rings.
         Returns [(det, item, label, confidence)] in reading order (top to bottom, then left to right)."""
         self.status.emit("Capturing: counting and classifying the jewels...")
-        if self.model is not None:  # one sharper pass on the still image for small pieces the live pass misses
+        if self.model is not None and not self.continuous_enabled:  # one sharper pass on the still image for small pieces the live pass misses
             sharp, _ = self.detect(self.model, frame, self.roi, imgsz=CAPTURE_IMGSZ)
 
             def known(d):  # already counted, or a piece of a counted jewel
@@ -1727,11 +1842,11 @@ class Worker(QtCore.QThread):
             if extra:
                 self.event.emit(f"Capture: the sharper pass found {len(extra)} more small jewel(s)", "info")
                 yolo_dets = list(yolo_dets) + extra
-        otsu = jewellery_mask(frame, self.roi, self.stone_box())
+        otsu = None if self.continuous_enabled else jewellery_mask(frame, self.roi, self.stone_box())
         dets = sorted(yolo_dets, key=lambda d: (int(d.box[1]), int(d.box[0])))
         jewels = []
         for d in dets:
-            if d.mask is not None:
+            if d.mask is not None and not self.continuous_enabled:
                 crop, cmask, bbox = jewel_crop(frame, otsu, d.mask, d.origin)
             else:
                 x1, y1, x2, y2 = (int(v) for v in d.box)
@@ -1740,7 +1855,9 @@ class Worker(QtCore.QThread):
                     "thumb": crop_box(frame, d.box).copy()}  # the jewel as it lies, for the status table
             jewels.append((d, item, "", 0.0))
         self.event.emit(f"Capture: YOLO counted {len(jewels)} jewel(s)", "info")
-        self.save_capture(frame, jewels)
+        if not self.continuous_enabled:
+            self.save_capture(frame, jewels)
+        # Continuous evidence/ID pictures are written by the independent recorder.
         return jewels
 
     def save_capture(self, frame, jewels):
@@ -1824,21 +1941,25 @@ class Worker(QtCore.QThread):
         # closed world: if only one jewel is out of sight, a still, unclaimed box on the bench that the ID model does
         # not call "not a jewel" is that jewel (16-10: an earring put down a little away was left unclaimed)
         lost = [i for i in range(len(self.tracks)) if i not in match]
-        if ready and len(lost) == 1:
+        recent_hand_return = (self.continuous_enabled and len(lost) == 1
+                              and t-getattr(self.tracks[lost[0]], 'hand_last', -1e9) <= 15)
+        if len(lost) == 1 and (ready or recent_hand_return):
             tr = self.tracks[lost[0]]
             cands = []
             for j in free:
                 d = dets[j]
-                if (not self.is_stable(d, t) or self.roi_dist(d.c) <= 0 or self.on_stone(d.c, margin=0)
+                stable_return = (d.stable_since is not None and t-d.stable_since >= .10) if recent_hand_return else self.is_stable(d, t)
+                if (not stable_return or self.roi_dist(d.c) <= 0 or self.on_stone(d.c, margin=0)
                         or not 0.25 <= d.area / max(tr.area, 1.0) <= 4.0):
                     continue
-                jid, p = self.identify(frame, d)
-                if jid is None and p >= ID_MIN_PROB:
-                    continue  # the model is sure it is not a jewel
-                if jid is not None and jid != tr.id and p >= ID_MIN_PROB:
-                    continue  # the model is sure it is another jewel
+                if ready:
+                    jid, p = self.identify(frame, d)
+                    if jid is None and p >= ID_MIN_PROB:
+                        continue
+                    if jid is not None and jid != tr.id and p >= ID_MIN_PROB:
+                        continue
                 cands.append(j)
-            if cands:
+            if cands and (ready or len(cands) == 1):
                 j = min(cands, key=lambda j: float(np.hypot(*(dets[j].c - tr.pos))))
                 match[lost[0]] = j
                 free.remove(j)
@@ -1863,11 +1984,40 @@ class Worker(QtCore.QThread):
             elif frame is not None and t - tr.last_seen > 0.3:
                 tr.spot = self.spot_state(tr, frame)
                 tr.removed_since = (tr.removed_since or t) if tr.spot == "removed" else None
+        if self.continuous_enabled and frame is not None:
+            for i, tr in enumerate(self.tracks):
+                tr.in_hand = i in seen and self.hand_contact(tr, frame)
         self.update_rubbing(t)
         self.update_acid(t)
         for i, tr in enumerate(self.tracks):
             self.evaluate(tr, i in seen, t)
+            if self.continuous_enabled and (getattr(tr, 'in_hand', False) or tr.spot == 'hand'
+                    or (tr.spot == 'removed' and getattr(self, 'moving_now', False))):
+                tr.hand_last = t
             self.check_done(tr, i in seen, t)
+
+    @staticmethod
+    def hand_contact(tr, frame):
+        # A visible jewel can still be held. Reuse the existing skin-colour cue
+        # around its segmented pixels; absence alone never becomes hand evidence.
+        mask = tr.det_mask
+        if mask is None:
+            return False
+        ox, oy = map(int, tr.det_origin)
+        fh, fw = frame.shape[:2]
+        mh, mw = mask.shape
+        x1, y1, x2, y2 = max(0, ox-8), max(0, oy-8), min(fw, ox+mw+8), min(fh, oy+mh+8)
+        if x2 <= x1 or y2 <= y1:
+            return False
+        local = np.zeros((y2-y1, x2-x1), np.uint8)
+        ix1, iy1, ix2, iy2 = max(ox, x1), max(oy, y1), min(ox+mw, x2), min(oy+mh, y2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return False
+        local[iy1-y1:iy2-y1, ix1-x1:ix2-x1] = (mask[iy1-oy:iy2-oy, ix1-ox:ix2-ox] > 0).astype(np.uint8)
+        contact = cv2.dilate(local, np.ones((17,17), np.uint8)) > 0
+        hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+        skin = (hsv[:,:,0] <= SKIN_H_MAX) & (hsv[:,:,1] >= SKIN_S_MIN) & (hsv[:,:,2] > 60)
+        return np.count_nonzero(skin & contact) >= max(60, .12*np.count_nonzero(contact))
 
     def update_motion(self, frame, t):
         """Is anything (a hand) moving over the bench? Sets self.still_since (None while moving)."""
@@ -2028,6 +2178,11 @@ class Worker(QtCore.QThread):
             self.rub_ev, self.rubbing_now = None, False
             return
         ev, rubbing, ts = self.rubber.snapshot()
+        if self.continuous_enabled:
+            fresh = 0 <= t-ts < RUB_GAP_S
+            self.rub_ev = ev if fresh else None
+            self.rubbing_now = bool(rubbing and fresh)
+            return  # identity comes from in-hand/under-hand history, not stone entry
         fresh = 0 <= t - ts < RUB_GAP_S
         # Display gold immediately on entry, independently of rubbing credit.
         self.rub_ev = ev if fresh and self.acid_pending_id is None else None
@@ -2125,6 +2280,9 @@ class Worker(QtCore.QThread):
         self.update_acid(t)
         for i, tr in enumerate(self.tracks):
             self.evaluate(tr, i in seen, t)
+            if self.continuous_enabled and (getattr(tr, 'in_hand', False) or tr.spot == 'hand'
+                    or (tr.spot == 'removed' and getattr(self, 'moving_now', False))):
+                tr.hand_last = t
             self.check_done(tr, i in seen, t)
 
     def pick_rubbed_jewel(self, ev, t):
@@ -2231,7 +2389,7 @@ class Worker(QtCore.QThread):
             self.stone_cleanup_pending = True
             self.invalidate_rub_reference()
             prediction = record['prediction']
-            label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INCONCLUSIVE'}[prediction['prediction']]
+            label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INVALID (acid model)'}[prediction['prediction']]
             self.event.emit(f"J{tr.id}: {label} ({prediction['confidence']:.1%}). Clean and dry the stone; its next reference will be captured automatically", "info")
             self.emit_jewel_table()
             return True
@@ -2246,6 +2404,8 @@ class Worker(QtCore.QThread):
             return True
 
     def check_done(self, tr, seen, t):
+        if self.continuous_enabled:
+            return
         """DONE = rubbed and acid tested, then seen off the stone lying still for DONE_SETTLE_S."""
         if not tr.rubbed or tr.done or (ACID_REQUIRED and not tr.acid_done):
             return
@@ -2313,11 +2473,18 @@ class Worker(QtCore.QThread):
     def draw(self, vis, dets, t):
         if self.roi is not None:
             cv2.polylines(vis, [self.roi], True, ROI_COLOR, 2)
+        if self.test_roi is not None:
+            cv2.polylines(vis, [self.test_roi.astype(np.int32)], True, (255, 180, 30), 2)
+            tx, ty = self.test_roi.reshape(-1, 2).min(axis=0).astype(int)
+            cv2.putText(vis, 'STONE TEST ROI', (tx, max(20, ty-8)), FONT, .6, (255, 180, 30), 2)
         stone = self.stone_box()
-        pending = next((tr for tr in self.tracks if tr.id == self.acid_pending_id), None)
+        pending_id = self.continuous_pending_id if self.continuous_enabled else self.acid_pending_id
+        pending = next((tr for tr in self.tracks if tr.id == pending_id), None)
         roi_mask = getattr(pending, 'acid_roi_mask', None)
         roi_stone = getattr(pending, 'acid_roi_stone', None)
-        if roi_stone is not None and getattr(pending, "new_rub_target", None) is not None:
+        if self.continuous_enabled and self.continuous_mask is not None:
+            roi_mask, roi_stone = self.continuous_mask['mask'], self.continuous_mask['stone']
+        if roi_stone is not None and (self.continuous_enabled or getattr(pending, "new_rub_target", None) is not None):
             stone = roi_stone  # keep the confirmed region through hand/model interference
         if stone is not None:
             cv2.rectangle(vis, stone[:2], stone[2:], STONE_COLOR, 2)
@@ -2325,6 +2492,8 @@ class Worker(QtCore.QThread):
         if (roi_mask is not None and roi_mask.shape == vis.shape[:2] and stone is not None
                 and roi_stone is not None and box_iou(stone, roi_stone) >= .95):
             draw_acid_roi(vis, roi_mask)
+            if self.continuous_enabled and self.continuous_target_uncertain:
+                cv2.putText(vis, 'RUB LOCATION: VISIBILITY UNCERTAIN', (15, 65), FONT, .65, (0, 180, 255), 2)
         if self.rub_ev is not None:
             ev = self.rub_ev
             ox, oy = ev["origin"]
@@ -2353,6 +2522,8 @@ class Worker(QtCore.QThread):
             col = COLORS[tr.state]
             name = f"J{tr.id}"  # the type is only listed in the side panel, not predicted on the video
             label = name if tr.state == "OK" else f"{name} {tr.state}"
+            if self.continuous_enabled and getattr(tr, "in_hand", False):
+                label = f"{name} in hand"
             if tr.state in ("OK", "OCCLUDED", "RUBBING"):
                 if tr.done:
                     col, label = DONE_COLOR, f"{name} DONE"
@@ -2374,11 +2545,13 @@ class Worker(QtCore.QThread):
                 cv2.circle(vis, tuple(int(v) for v in tr.pos), 4, col, -1)
             else:  # out of sight: dashed box where it was last seen
                 away = t - max(tr.last_seen, tr.rub_last)
+                if self.continuous_enabled and tr.state in ("LEFT_ROI", "MISSING"):
+                    label = f"{name} MISSED"
                 if tr.state == "OCCLUDED":
                     if tr.spot == "hand":
                         label = f"{name} under a hand"
                     elif tr.spot == "removed" and tr.removed_since is not None:
-                        label = (f"{name} removed (hands at work)" if self.bench_still_for(t) < BENCH_STILL_S
+                        label = (f"{name} in hand" if self.bench_still_for(t) < BENCH_STILL_S
                                  else f"{name} removed {t - max(tr.removed_since, tr.rub_last):.0f}/{REMOVED_ALERT_S:.0f}s")
                     else:
                         label = f"{name} not seen (still there?)"
@@ -2405,6 +2578,9 @@ class Worker(QtCore.QThread):
             if self.acid_pending_id is not None:
                 text += f"   |   J{self.acid_pending_id}: " + ("acid test running" if self.acid_token else "click Start acid test")
             cv2.putText(vis, text, (10, bottom), FONT, 0.8, DONE_COLOR, 2)
+        if self.continuous_enabled:
+            stage = dict(self.continuous_stage, mask_uncertain=self.continuous_target_uncertain and self.continuous_mask is not None)
+            draw_workflow(vis, stage, [tr.id for tr in self.tracks if tr.done], self.continuous_acid)
         if alerts:
             cv2.rectangle(vis, (0, 0), (vis.shape[1], 42), (0, 0, 255), -1)
             cv2.putText(vis, "ALERT: " + ", ".join(alerts), (10, 30), FONT, 0.9, (255, 255, 255), 2)
@@ -2448,7 +2624,7 @@ def beep():
 
 
 class MainWindow(QtWidgets.QWidget):
-    ZONE_NAMES = {"roi": "ROI", "stone": "stone"}
+    ZONE_NAMES = {"roi": "ROI", "stone": "stone", "test": "test position"}
 
     def __init__(self):
         super().__init__()
@@ -2489,6 +2665,7 @@ class MainWindow(QtWidgets.QWidget):
         self.video = VideoLabel()
         self.btn_roi = QtWidgets.QPushButton("Draw ROI")
         self.btn_stone = QtWidgets.QPushButton("Draw stone")
+        self.btn_test = QtWidgets.QPushButton("Draw test position ROI")
         self.btn_clear = QtWidgets.QPushButton("Clear zones")
         # J | jewel (crop at capture) | Rubbed | rub spot (image, once rubbed) | Acid test - updated as they happen
         self.acid_models = AcidModelCache()
@@ -2506,7 +2683,17 @@ class MainWindow(QtWidgets.QWidget):
         self.rub_instruction.setWordWrap(True)
         self.chk_existing_rub_marks = QtWidgets.QCheckBox("Show existing rub marks (OFF)")
         self.chk_existing_rub_marks.setToolTip("Show green starting-mark overlays for development. Detection stays active when hidden.")
-        self.rub_preview = QtWidgets.QLabel("Before / after rubbing")
+        self.phase_label = QtWidgets.QLabel("PROCESS: Waiting for before-stone capture")
+        self.phase_label.setWordWrap(True)
+        self.phase_label.setStyleSheet("font-weight: bold; font-size: 15px; color: #075985;")
+        self.done_label = QtWidgets.QLabel("Completed jewels: none")
+        self.done_label.setStyleSheet("font-weight: bold; color: #16803c;")
+        self.before_instruction = QtWidgets.QLabel("Before stone: not captured yet")
+        self.before_preview = QtWidgets.QLabel("Before stone image")
+        self.before_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.before_preview.setMinimumHeight(100)
+        self.before_preview.setMaximumHeight(150)
+        self.rub_preview = QtWidgets.QLabel("New rubbing mask")
         self.rub_preview.setAlignment(QtCore.Qt.AlignCenter)
         self.rub_preview.setMinimumHeight(160)
         self.rub_preview.setMaximumHeight(210)
@@ -2520,7 +2707,10 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_stone_ready.setEnabled(False)
         self.btn_cancel_acid = QtWidgets.QPushButton("Cancel acid test")
         self.btn_cancel_acid.setEnabled(False)
-        self.acid_instruction = QtWidgets.QLabel("Rub any jewel first. Verify fresh pH paper for every jewel.")
+        self.acid_instruction = QtWidgets.QLabel("Automatic recording. Rub a jewel and return it; no Ready or Retake step.")
+        self.report_label = QtWidgets.QLabel("PDF: saved automatically with the session")
+        self.report_label.setWordWrap(True)
+        self.report_label.setOpenExternalLinks(True)
         self.acid_instruction.setWordWrap(True)
         self.chk_ph_verification = QtWidgets.QCheckBox("pH verification (ON)")
         self.chk_ph_verification.setChecked(True)
@@ -2532,7 +2722,7 @@ class MainWindow(QtWidgets.QWidget):
         self.acid_grade = QtWidgets.QLineEdit()
         self.acid_grade.setPlaceholderText("Acid grade / batch (optional)")
         self.table = QtWidgets.QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["J", "Jewel", "Rubbed", "Rub spot", "Acid", "Result", "pH / Acid crop"])
+        self.table.setHorizontalHeaderLabels(["J", "Jewel", "Rubbing evidence", "Rub spot", "Acid", "Result", "Acid crop"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -2542,7 +2732,7 @@ class MainWindow(QtWidgets.QWidget):
         for c in (1, 3, 6):
             hdr.setSectionResizeMode(c, QtWidgets.QHeaderView.Stretch)
         self.table.setMinimumHeight(260)
-        self.table.setToolTip("Green row = DONE (rubbed, acid tested and placed back)")
+        self.table.setToolTip("Green row = capture finished; the acid model result is shown separately")
         self.btn_reset = QtWidgets.QPushButton("Reset (re-arm)")
         self.lbl_status = QtWidgets.QLabel("Not connected")
         self.log = QtWidgets.QListWidget()
@@ -2561,10 +2751,15 @@ class MainWindow(QtWidgets.QWidget):
         side = QtWidgets.QVBoxLayout()
         side.addWidget(self.btn_roi)
         side.addWidget(self.btn_stone)
+        side.addWidget(self.btn_test)
         side.addWidget(self.btn_clear)
         side.addLayout(form)
         side.addWidget(self.btn_reset)
         side.addWidget(self.btn_rub_reference)
+        side.addWidget(self.phase_label)
+        side.addWidget(self.done_label)
+        side.addWidget(self.before_instruction)
+        side.addWidget(self.before_preview)
         side.addWidget(self.rub_instruction)
         side.addWidget(self.chk_existing_rub_marks)
         side.addWidget(self.rub_preview)
@@ -2576,6 +2771,12 @@ class MainWindow(QtWidgets.QWidget):
         side.addWidget(self.btn_stone_ready)
         side.addWidget(self.btn_cancel_acid)
         side.addWidget(self.acid_instruction)
+        side.addWidget(self.report_label)
+        # Continuous capture has no manual test handoff or retry controls.
+        for control in (self.btn_rub_reference, self.btn_start_acid, self.btn_stone_ready,
+                        self.btn_cancel_acid, self.chk_auto_test, self.chk_ph_verification,
+                        self.acid_duration, self.acid_grade):
+            control.hide()
         side.addWidget(self.lbl_status)
         self.lbl_jewels = QtWidgets.QLabel("Jewels: counted when the stone is placed")
         side.addWidget(self.lbl_jewels)
@@ -2605,6 +2806,7 @@ class MainWindow(QtWidgets.QWidget):
         self.cam_mode.currentIndexChanged.connect(self.switch_camera)
         self.btn_roi.clicked.connect(lambda: self.toggle_draw("roi"))
         self.btn_stone.clicked.connect(lambda: self.toggle_draw("stone"))
+        self.btn_test.clicked.connect(lambda: self.toggle_draw("test"))
         self.btn_clear.clicked.connect(self.clear_zones)
         self.btn_reset.clicked.connect(self.rearm)
         self.btn_rub_reference.clicked.connect(lambda: self.capture_rub_reference(manual=True))
@@ -2627,7 +2829,7 @@ class MainWindow(QtWidgets.QWidget):
         self.rub_timer.start(200)
         self.preview_key = None
         self.set_running(False)
-        loaded = [self.ZONE_NAMES[k] for k in ("roi", "stone") if self.zones[k]]
+        loaded = [self.ZONE_NAMES[k] for k in ("roi", "stone", "test") if self.zones[k]]
         if loaded:
             self.add_log("Loaded saved " + " and ".join(loaded), "info")
         QtCore.QTimer.singleShot(0, self.toggle_connect)  # connect to the camera on startup
@@ -2637,9 +2839,9 @@ class MainWindow(QtWidgets.QWidget):
         try:
             with open(ZONES_FILE) as f:
                 data = json.load(f)
-            return {k: [tuple(p) for p in data.get(k, [])] for k in ("roi", "stone")}
+            return {k: [tuple(p) for p in data.get(k, [])] for k in ("roi", "stone", "test")}
         except Exception:
-            return {"roi": [], "stone": []}
+            return {"roi": [], "stone": [], "test": []}
 
     def save_zones(self):
         # write to a temp file first so a crash mid-write can't corrupt the saved zones
@@ -2652,7 +2854,7 @@ class MainWindow(QtWidgets.QWidget):
             self.add_log(f"Could not save zones: {e}", "alert")
 
     def zone_button(self, kind):
-        return self.btn_stone if kind == "stone" else self.btn_roi
+        return {"stone": self.btn_stone, "test": self.btn_test, "roi": self.btn_roi}[kind]
 
     def toggle_draw(self, kind):
         if self.drawing == kind:
@@ -2679,15 +2881,16 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.set_draft([])
 
     def clear_zones(self):
-        if QtWidgets.QMessageBox.question(self, "Clear zones", "Delete the saved ROI and stone?") \
+        if QtWidgets.QMessageBox.question(self, "Clear zones", "Delete the saved ROI, stone and test position?") \
                 != QtWidgets.QMessageBox.Yes:
             return
-        self.zones = {"roi": [], "stone": []}
+        self.zones = {"roi": [], "stone": [], "test": []}
         if os.path.exists(ZONES_FILE):
             os.remove(ZONES_FILE)
         if self.worker:
             self.worker.set_zone("roi", [])
             self.worker.set_zone("stone", [])
+            self.worker.set_zone("test", [])
         self.add_log("Zones cleared", "info")
 
     def on_click(self, x, y, left):
@@ -2840,7 +3043,7 @@ class MainWindow(QtWidgets.QWidget):
 
     # ---- control ----
     def set_running(self, running):
-        for w in (self.btn_roi, self.btn_stone, self.btn_clear, self.btn_reset):
+        for w in (self.btn_roi, self.btn_stone, self.btn_test, self.btn_clear, self.btn_reset):
             w.setEnabled(running)
         for w in (self.url, self.cam_usb, self.cam_res, self.cam_ip, self.cam_stream, self.cam_user, self.cam_pass):
             w.setEnabled(not running)
@@ -2858,13 +3061,71 @@ class MainWindow(QtWidgets.QWidget):
         shown = (f"camera {source}" if isinstance(source, int) else urlparse(source).hostname or source)
         self.add_log(f"Connecting to {CAMERA_MODES[self.cam_mode_key]}: {shown}", "info")
         camera = None if self.cam_mode_key == "custom" else self.cameras[self.cam_mode_key]
-        self.worker = Worker(source, self.zones["roi"], self.zones["stone"], camera=camera)
+        self.worker = Worker(source, self.zones["roi"], self.zones["stone"], camera=camera,
+                             continuous=True, test_pts=self.zones.get('test'),
+                             rub_models=self.rub_models, acid_models=self.acid_models)
+        self.worker.workflow.connect(self.continuous_update)
         self.worker.jewel_list.connect(self.show_jewels)
         self.worker.jewel_table.connect(self.show_table)
         self.worker.event.connect(self.add_log)
         self.worker.status.connect(self.lbl_status.setText)
         self.worker.start()
         self.set_running(True)
+
+    def continuous_update(self, payload):
+        if self.sender() is not self.worker:
+            return
+        kind = payload['kind']
+        if 'completed' in payload:
+            self.done_label.setText(' | '.join(f'J{jid} DONE' for jid in payload['completed']) or 'Completed jewels: none')
+        if kind == 'status':
+            self.acid_instruction.setText(payload['message'])
+        elif kind == 'phase':
+            prefix = f"J{payload['jewel_id']} | " if payload.get('jewel_id') is not None else ''
+            title = PHASE_TITLES.get(payload['phase'], payload['phase'])
+            if payload.get('remaining') is not None:
+                title += f" ({payload['remaining']:.1f} s left)"
+            self.phase_label.setText(prefix+'PROCESS: '+title)
+            self.acid_instruction.setText(payload['message'])
+        elif kind == 'report':
+            from html import escape
+            url = QtCore.QUrl.fromLocalFile(payload['path']).toString()
+            self.report_label.setText(f'<a href="{escape(url)}">Open session PDF</a>')
+        elif kind == 'reference':
+            self.before_instruction.setText('Before stone: CAPTURED '+time.strftime('%H:%M:%S', time.localtime(payload['timestamp'])))
+            self.before_preview.setPixmap(QtGui.QPixmap.fromImage(to_qimage(payload['photo'])).scaled(
+                360, 140, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        elif kind == 'mask':
+            image = payload['photo']
+            if payload.get('stone') is not None:
+                x1,y1,x2,y2 = payload['stone']
+                image = image[max(0,y1-12):y2+12, max(0,x1-12):x2+12]
+            self.rub_preview.setPixmap(QtGui.QPixmap.fromImage(to_qimage(image)).scaled(
+                360, 180, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            self.rub_instruction.setText('New rubbed mask: DETECTED and marked on the video.'
+                                         + (' Previous acid overlap: contamination possible.' if payload.get('contamination_possible') else ''))
+        elif kind == 'mask_decision':
+            self.rub_instruction.setText('New rubbed mask: '+('DETECTED' if payload['detected'] else 'NOT DETECTED')+'. Moving to baseline.'
+                                         + (' Previous acid overlap: contamination possible.' if payload.get('contamination_possible') else ''))
+        elif kind == 'acid_detection':
+            self.acid_instruction.setText('ACID DETECTED - acid search stopped; recording 5-second reaction.' if payload['detected'] else
+                                          ('PREVIOUS/BASELINE ACID IGNORED - fresh application not confirmed; session remains active.'
+                                           if 'IGNORED' in payload.get('freshness', '') else
+                                           'FRESH ACID APPLICATION NOT CONFIRMED - session remains active.'))
+        elif kind == 'captured':
+            self.acid_instruction.setText('Five-second reaction captured. Processing the result.' if payload.get('capture_complete', True) else
+                                          'Session stopped before a complete reaction; saving available evidence.')
+        elif kind == 'result' and self.worker.continuous_cycle_id is None:
+            record = payload['record']
+            if record.get('capture_complete') and record.get('prediction') is not None:
+                name = f"J{record['jewel_id']}" if record['jewel_id'] is not None else 'Unassigned test'
+                self.phase_label.setText(name+' DONE | '+prediction_text(record['prediction']))
+                notes = [record['prediction'].get('invalid_reason')]
+                if record.get('acid_target_status') == 'ACID_AT_DIFFERENT_LOCATION':
+                    notes.append('New rubbing and acid are at different locations; application to this jewel mark was not verified.')
+                if record.get('rub_previous_acid_overlap', 0) > 0:
+                    notes.append('New rubbing overlaps previous acid; contamination possible.')
+                self.acid_instruction.setText(' '.join(n for n in notes if n) or 'Acid result saved to PDF.')
 
     def refresh_preview(self):
         worker = self.worker
@@ -2909,11 +3170,14 @@ class MainWindow(QtWidgets.QWidget):
         self.table.setRowCount(len(rows))
         for r, (jid, thumb, rubbed, rub_img, acid, done, record, pending, acid_image) in enumerate(rows):
             bg = "#c8f0c8" if done else "transparent"
-            prediction = record['prediction'] if record else None
-            result_text = (f"{ {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INCONCLUSIVE'}[prediction['prediction']]}\n{prediction['confidence']:.1%}"
-                           if prediction else "")
+            prediction = record.get('prediction') if record else None
+            result_text = (f"{ {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INVALID (acid model)'}[prediction['prediction']]}\n{prediction['confidence']:.1%}"
+                           if prediction else ("No acid result generated" if record and acid else ""))
             acid_text = "\u2714" if acid else ("Testing" if pending and self.worker and self.worker.acid_token else "Ready" if pending else "")
-            for c, text in ((0, f"J{jid}"), (2, "\u2714" if rubbed else ""), (4, acid_text), (5, result_text)):
+            if self.worker is not None and self.worker.continuous_enabled:
+                acid_text = "DONE" if done else "Saved" if acid else ("Recording" if pending else "Processing" if record else "")
+            rubbing_text = record.get('rubbing_status', '') if record else ("\u2714" if rubbed else "")
+            for c, text in ((0, f"J{jid}"), (2, rubbing_text), (4, acid_text), (5, result_text)):
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 font = item.font()
@@ -2925,9 +3189,9 @@ class MainWindow(QtWidgets.QWidget):
                     item.setBackground(QtGui.QColor(200, 240, 200))
                 if c == 5 and record:
                     item.setToolTip(f"Prediction only; verified label not set.\nCapture: {record['record_path']}")
-                    if prediction['prediction'] == 'invalid':
+                    if prediction and prediction['prediction'] == 'invalid':
                         item.setForeground(QtGui.QColor(180, 110, 0))
-                    elif prediction['prediction'] == 'non_gold':
+                    elif prediction and prediction['prediction'] == 'non_gold':
                         item.setForeground(QtGui.QColor(190, 30, 30))
                 self.table.setItem(r, c, item)
             for c, img in ((1, thumb), (3, rub_img), (6, acid_image)):
@@ -2989,6 +3253,8 @@ class MainWindow(QtWidgets.QWidget):
                                              QtCore.Qt.SmoothTransformation))
 
     def rub_guidance_tick(self):
+        if self.worker is not None and self.worker.continuous_enabled:
+            return
         job = self.rub_job
         if job is not None and job['future'].done():
             self.rub_job = None
@@ -3139,6 +3405,8 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_acid_controls()
 
     def refresh_acid_controls(self):
+        if self.worker is not None and self.worker.continuous_enabled:
+            return
         pending = self.worker.acid_pending_id if self.worker else None
         busy = self.acid_thread is not None or (
             self.rub_job is not None and self.rub_job['kind'] != 'cleanup')
@@ -3278,7 +3546,7 @@ class MainWindow(QtWidgets.QWidget):
     def acid_completed(self, payload):
         if self.current_acid_payload(payload) and self.worker.finish_acid_test(payload):
             prediction = payload['result']['prediction']
-            label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INCONCLUSIVE'}[prediction['prediction']]
+            label = {'gold_22k': '22K GOLD', 'non_gold': 'NON-GOLD', 'invalid': 'INVALID (acid model)'}[prediction['prediction']]
             self.acid_instruction.setText(f"J{payload['jewel_id']}: {label} ({prediction['confidence']:.1%}). Clean and dry the stone. The next reference will be captured after it is uncovered and still.")
 
     def acid_failed(self, payload):
@@ -3319,6 +3587,10 @@ class MainWindow(QtWidgets.QWidget):
 
     def rearm(self):
         if not self.worker:
+            return
+        if self.worker.continuous_enabled:
+            if self.stop_worker():
+                self.toggle_connect()
             return
         if not self.cancel_acid_test():
             return
@@ -3376,7 +3648,7 @@ def log_crash(kind, value, tb):
 
 if __name__ == "__main__":
     sys.excepthook = log_crash
-    write_log(f"START  Jewel Guard | app={os.path.abspath(__file__)} | python={sys.executable} | pH gate enabled")
+    write_log(f"START  Jewel Guard | app={os.path.abspath(__file__)} | python={sys.executable} | continuous capture")
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
     w.resize(1280, 760)

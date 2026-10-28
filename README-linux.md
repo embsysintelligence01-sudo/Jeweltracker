@@ -5,6 +5,113 @@ Python environment: `.venv` (Python 3.10, CPU PyTorch).
 
 ## Run
 
+The tracker now opens in **continuous capture** mode. Configure the bench ROI
+and optionally **Draw test position ROI** once; otherwise the first visible
+stone establishes a displayed test-position rectangle.
+The automatic rectangle expands during initial setup as the complete stone
+becomes visible, then freezes when tracking starts. A manually drawn ROI stays
+fixed throughout. IDs/crops target two seconds after jewels first appear with
+the stone present. There is no per-jewel
+Ready, Retake or Retry action. Old manual adapters remain available to their
+standalone tools, but do not control the main window's continuous flow.
+
+The camera records timestamped JPEG evidence at a target 15 FPS on an independent,
+bounded writer. Processing uses the newest frame; queue drops and camera gaps
+are saved. A visible held jewel uses the existing skin/contact heuristic, and a
+covered jewel uses the existing under-hand/bench-motion evidence. Absence alone
+does not establish an in-hand identity. Ambiguous or completely missed IDs stay
+explicit in the evidence record.
+
+Trial pickup policy: **UNDER_HAND alone does not start a jewel's recording/test
+cycle**, and does not seed its recent pickup history. IN_HAND evidence can start
+the cycle; a cycle already in progress continues through later hand coverage.
+The full session recording and under-hand visibility notes remain available.
+`PICKUP_STATES` in `continuous_testing.py` currently contains only `IN_HAND`.
+
+The before-stone reference now starts as soon as a clear stone is available,
+including while initial IDs are still being assigned. Its image is saved under
+the session's `references/` folder, shown in the side panel and included in the
+PDF for each jewel. Development text on the video shows the current process,
+new-mask outcome, acid detection state, reaction countdown and completed IDs.
+
+After jewel return and stone placement inside the displayed ROI, the new-rub
+check completes with a detected/not-detected decision (maximum one-second
+decision window). The baseline stage starts after that decision; camera evidence
+continues recording throughout. Missing masks can still be recovered later.
+Model preparation happens before the test. Corner continuity handles a plain
+stone whose texture cannot be aligned; its orientation through complete
+occlusion remains an assumption recorded in the manifest. Missing evidence never
+asks the operator to repeat the process.
+
+One qualifying fresh-acid detection at confidence 0.60 stops further acid detection for that jewel
+and triggers five seconds from its **camera frame timestamp**. The reaction is
+then classified and the jewel's DONE indicator stays visible during the next
+test. When acid is not detected, the current session stays active without a
+timeout, including when another jewel is handled. Only an explicit session
+stop/reset ends that wait without detection. Recorded-frame recovery also runs
+while waiting and can confirm an application missed live. Acid inference uses a
+padded stone crop. Failed live rubbing,
+mask and acid checks are recovered from the recorded sequence in a background
+worker. Pre-acid frames alone can establish a new rubbing mask. Two seconds
+before detected onset and five seconds after it are exported with timestamp
+sidecars; incomplete footage, coverage and wiping are recorded separately. A
+two-second video buffer does not guarantee two clear baseline seconds. Models,
+thresholds and classifier preprocessing are unchanged; the faster temporal capture
+protocol still requires field validation on labelled sequences.
+
+Previous acid footprints persist in stone coordinates between jewels and through
+hand coverage. The fresh-application gate runs for live detections, background
+recovery and final export. Unchanged baseline patches and detections overlapping
+previous acid do not start another timer. A new detector footprint must have a
+localized appearance change outside remembered acid, with recent known stone
+geometry. The present detector cannot establish a new dose in an already wet
+patch; that case keeps waiting with an explicit note. It adds no fixed wait and
+does not request a repeat. Footprints use boxes rather than chemical masks;
+camera/stone orientation through complete occlusion remains an assumption.
+
+Residue history is cleared only after at least three stable clear negative
+observations over 0.6 seconds AND visual similarity to an earlier observed dry
+surface. Missing detections or hand coverage alone never clear it. This is visual
+evidence, not a measurement of chemical cleanliness. A new rubbing overlapping
+previous acid receives a contamination warning independently of the model result.
+
+Recorded rubbing recovery checks only the current jewel's pickup-to-return,
+pre-acid interval. It reuses the jewel segmentation model at low priority,
+clips gold evidence to the stone, rejects skin-dominated masks, and saves a
+stone close-up with the visible gold marked. Back-and-forth motion is required
+to call rubbing recovered. Contact-only and not-visible cases are distinguished;
+a new mark alone is not proof of visible rubbing contact. Photos include source
+frame timestamps. Background work samples at most 24 frames per jewel.
+
+The PDF includes a same-frame comparison: magenta new-rub contour and cyan acid
+detector footprint, with the overlap status and a warning when locations differ.
+The 50% overlap-of-the-smaller-region check does not block the classifier or
+replace its result. A missing mask makes the comparison unavailable. Runtime
+INVALID explanations distinguish a model INVALID class from the existing 65%
+general and 85% gold confidence thresholds; they do not invent a physical cause.
+
+Outputs are in `captures/sessions/<session>/`: `report.pdf`, `session.json`, a
+frame index and recorded frames, plus per-test masks, pictures, reaction crops,
+pickup/rubbing/return video and acid video. Reports update automatically after
+each result and at disconnect/reset. They contain only IDs, actual pictures,
+tracking visibility, rubbing/mask evidence and acid-model output. No unsupported
+stone-risk, thread, weight or sealing sections are added. Process warnings never
+replace `gold_22k`, `non_gold` or `invalid` from the acid runtime; a missing runtime
+result is displayed as **No acid result generated**. The runtime's `invalid`
+class is displayed as **INVALID (acid model)**. Continuous capture does not wait
+for the old pH-paper stage; the manifest/PDF records that pH was not observed.
+
+Initial analysis and mask timing are targets, dependent on actual camera frames
+and CPU load. Recording continues when a deadline cannot produce confirmed
+evidence. `reportlab` is required and included in `requirements.txt`.
+
+Continuous mode uses position tracking plus recent hand history for a unique
+returned-jewel association. It does not start the older per-session ResNet
+training job. Corner tracking supplies the photo geometry without repeating
+stone-model inference for each mask. The stone model refreshes at up to 5 FPS
+while corner tracking continues on fresh frames; idle acid checks run at up to
+2 FPS and armed acid checks at up to 5 FPS to keep CPU available for mask capture.
+
 ```bash
 cd /home/embsys/Desktop/jewel_tracker/jewel_tracker
 ./run_tracker.sh
@@ -66,7 +173,12 @@ Both sessions confirmed 50 Hz / 20 ms / brightness 96 / gain 0 and delivered
 brightness variation measured 0.14–0.25%. These checks verify capture and
 camera settings; an operator still needs to validate a physical acid test.
 
-## File check and verification
+## Earlier implementation and validation notes
+
+The sections below describe earlier releases and the retained legacy adapters.
+For the current main-window workflow, use the continuous-capture instructions
+above; manual rubbing gates, Retake/Ready actions and per-session ResNet training
+described below are superseded in continuous mode.
 
 `rojeweltrack.onnx` serves both jewellery tracking and gold-on-stone
 segmentation from **one unmodified full-camera-frame prediction** per live
@@ -173,7 +285,7 @@ SigLIP2 weights, `jewel_classifier.py`, and the classification caches are
 present, but jewel-type classification is disabled in this version's worker.
 The tracker requires the supplied `rojeweltrack.onnx`; it does not fall back to a different jewellery model.
 
-## Before/after rubbing guidance and acid ROI
+## Earlier before/after rubbing guidance and acid ROI
 
 The main application uses `new_rub_detection.flow.RubCheck` with the existing
 camera. Its separate Qt6 demo is not launched. When the stone is first visible,
@@ -279,7 +391,7 @@ tracking still uses its single full-frame pass at confidence 0.15. The supplied
 snapshot rubbed-mask model retains its separate 0.50 threshold. No second camera
 reader is opened and no model is retrained.
 
-## Camera and flow
+## Earlier camera and gated flow
 
 The main worker, ResNet identity model and rubbing watcher load on this PC.
 The integrated temporal acid worker starts after a confirmed new-rub mask,

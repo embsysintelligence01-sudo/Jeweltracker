@@ -13,6 +13,20 @@ MODEL_ARTIFACTS_ROOT = LAB_ROOT / "model_training" / "artifacts"
 GOLD_CONFIDENCE = 0.85
 GENERAL_CONFIDENCE = 0.65
 
+
+def classify_probabilities(values):
+    """Explain the existing thresholds without changing model decisions."""
+    index = int(np.argmax(values))
+    raw = TEMPORAL_CLASSES[index]
+    confidence = float(values[index])
+    if confidence < GENERAL_CONFIDENCE:
+        return 'invalid', raw, confidence, f'Highest model confidence {confidence:.1%} is below the {GENERAL_CONFIDENCE:.0%} minimum.'
+    if raw == 'gold_22k' and confidence < GOLD_CONFIDENCE:
+        return 'invalid', raw, confidence, f'Gold confidence {confidence:.1%} is below the {GOLD_CONFIDENCE:.0%} gold threshold.'
+    if raw == 'invalid':
+        return raw, raw, confidence, 'The model selected its INVALID class; the model does not identify a specific physical cause.'
+    return raw, raw, confidence, None
+
 def _sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -63,17 +77,14 @@ class TemporalMobileNet:
         probabilities = np.exp(shifted)
         probabilities /= np.sum(probabilities, axis=1, keepdims=True)
         values = probabilities[0]
-        index = int(np.argmax(values))
-        confidence = float(values[index])
-        prediction = TEMPORAL_CLASSES[index]
-        if confidence < GENERAL_CONFIDENCE or (
-            prediction == "gold_22k" and confidence < GOLD_CONFIDENCE
-        ):
-            prediction = "invalid"
+        prediction, raw_prediction, confidence, invalid_reason = classify_probabilities(values)
         return {
             "model": self.path.name,
             "model_sha256": self.sha256,
             "prediction": prediction,
+            "raw_prediction": raw_prediction,
+            "invalid_reason": invalid_reason,
+            "thresholds": dict(general=GENERAL_CONFIDENCE, gold=GOLD_CONFIDENCE),
             "confidence": confidence,
             "probabilities": {
                 name: float(values[position])
