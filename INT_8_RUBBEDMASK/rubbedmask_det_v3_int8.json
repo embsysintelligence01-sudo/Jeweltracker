@@ -1,0 +1,11 @@
+{
+  "precision": "INT8",
+  "names": [
+    "rubbedmask"
+  ],
+  "task": "detect",
+  "source": "models\\onnx\\rubbedmask_det_v3.onnx",
+  "calibration": "300 frames from D:/Embsys/Rubbing_Mask/dataset_v3/train/images",
+  "quantization": "detection head kept in float (--float-head)",
+  "trained_from": "rubbedmask_det_v3.pt (YOLOv8n detect, imgsz 640, Rubbing_Mask dataset_v3)"
+}

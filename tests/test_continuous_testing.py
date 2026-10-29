@@ -151,6 +151,7 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_actual_pickup_starts_cycle_and_later_coverage_does_not_end_it(self):
@@ -172,6 +173,7 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_auto_position_includes_full_stone_during_setup_but_never_moves_in_test(self):
@@ -195,6 +197,7 @@ class AutomaticFlowTests(unittest.TestCase):
                     monitor.pool.shutdown(wait=True)
                     monitor.detector_pool.shutdown(wait=True)
                     monitor.finish_pool.shutdown(wait=True)
+                    monitor.report_pool.shutdown(wait=True)
                     monitor.journal.close()
 
     def test_prepared_mask_must_persist_after_the_held_jewel_is_removed(self):
@@ -210,19 +213,22 @@ class AutomaticFlowTests(unittest.TestCase):
                 self.assertIsNone(active['mask'])
                 self.assertIsNone(active['mask_candidate'])
                 active['mask_candidate'] = candidate
-                monitor._confirm_candidate(active, scene(mark=True), 3.1)
+                active['contact_region']=candidate['new_mask'].copy()
+                for when in (3.1,3.2,3.3):
+                    monitor._confirm_candidate(active,scene(mark=True),when)
                 self.assertEqual('CONFIRMED_LIVE', active['mask_status'])
             finally:
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
-    def test_one_positive_source_frame_triggers_without_three_confirmations(self):
+    def test_one_model_positive_needs_two_clear_camera_frames_not_three_model_hits(self):
         with tempfile.TemporaryDirectory() as tmp:
             monitor = ContinuousMonitor(tmp, lambda: None, Photos(), Mock(), lambda *a, **k: None)
             try:
-                monitor.last_ts = 101
+                monitor.last_ts = 100.2
                 monitor.active = dict(id='test', jewel_id=1, returned=100, baseline_at=100,
                                       acid_onset=None, mask=None, started=99,
                                       fresh_gate=FreshAcidGate(np.zeros((256,256),np.uint8),scene(),QUAD))
@@ -230,12 +236,15 @@ class AutomaticFlowTests(unittest.TestCase):
                 future = Future()
                 future.set_result((100.2, 'test', [dict(bbox=(130,110,145,140), confidence=.9)]))
                 monitor.acid_job = future
-                monitor.step(dict(timestamp=101, frame=scene(), mode='LOCKED'))
+                monitor.step(dict(timestamp=100.2, frame=scene(acid=True), mode='LOCKED'))
+                self.assertIsNone(monitor.active['acid_onset'])
+                monitor._verify_application(monitor.active,scene(acid=True),QUAD,100.24,True,True)
                 self.assertEqual(100.2, monitor.active['acid_onset'])
             finally:
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_before_stone_is_saved_before_ids_are_locked(self):
@@ -261,9 +270,10 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
-    def test_no_acid_keeps_original_session_active_past_timeouts_and_next_jewel(self):
+    def test_no_acid_finalizes_each_jewel_after_inactivity(self):
         with tempfile.TemporaryDirectory() as tmp:
             events = []
             monitor = ContinuousMonitor(tmp, lambda: None, Photos(), Mock(), lambda kind, **kw: events.append((kind, kw)))
@@ -279,13 +289,13 @@ class AutomaticFlowTests(unittest.TestCase):
                                       stone=STONE, placement=None, bench_moving=held1 or held2,
                                       rubbing=False, tracks=tracks))
                     time.sleep(.003)
-                self.assertIsNotNone(monitor.active)
-                self.assertEqual(1, monitor.active['jewel_id'])
-                self.assertIsNone(monitor.active['acid_onset'])
-                self.assertIsNotNone(monitor.active['baseline_at'])
-                self.assertEqual('WAIT_FOR_ACID', monitor.active['phase'])
-                self.assertEqual([], monitor.tests)
-                self.assertFalse(any(kind == 'captured' for kind, _ in events))
+                self.assertIsNone(monitor.active)
+                self.assertTrue(any(kind=='captured' for kind,_ in events))
+                monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
+                self.assertEqual(2,len(monitor.tests))
+                self.assertTrue(all(r['close_reason']=='INACTIVITY_TIMEOUT' for r in monitor.tests))
+                self.assertTrue(all(r['prediction'] is None for r in monitor.tests))
                 phases = [payload['phase'] for kind, payload in events if kind == 'phase']
                 self.assertLess(phases.index('MASK_CHECK'), phases.index('BASELINE'))
                 self.assertLess(phases.index('BASELINE'), phases.index('WAIT_FOR_ACID'))
@@ -295,6 +305,7 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_development_overlay_shows_mask_acid_and_completed_jewels(self):
@@ -341,11 +352,13 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
                 self.assertEqual(1, len(monitor.tests))
                 record = monitor.tests[0]
                 self.assertEqual('RECOVERED_FROM_CLIP', record['acid_status'])
-                self.assertEqual('RECOVERED_FROM_CLIP', record['mask_status'])
+                self.assertEqual('UNCONFIRMED', record['mask_status'])
+                self.assertEqual('UNVERIFIED_CONTACT_LOCATION',record['mask_evidence_status'])
                 self.assertEqual('gold_22k', record['prediction']['prediction'])
                 self.assertAlmostEqual(7., record['acid_clip']['requested_end']-record['acid_clip']['requested_start'])
                 self.assertGreaterEqual(record['frame_counts']['reaction'], 20)
@@ -353,6 +366,7 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True, cancel_futures=True)
                 monitor.detector_pool.shutdown(wait=True, cancel_futures=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_no_mask_or_live_rubbing_does_not_block_single_hit_acid_and_next_jewel(self):
@@ -384,22 +398,28 @@ class AutomaticFlowTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
                 self.assertEqual(1, len(monitor.tests))
                 record = monitor.tests[0]
                 self.assertEqual('non_gold', record['prediction']['prediction'])
                 self.assertEqual('UNCONFIRMED', record['mask_status'])
                 self.assertEqual('UNCONFIRMED', record['rubbing_status'])
-                self.assertIn(record['acid_status'], ('DETECTED_LIVE_ONE_HIT', 'RECOVERED_FROM_CLIP'))
+                self.assertIn(record['acid_status'], ('VERIFIED_LIVE_PERSISTENT_PATCH', 'RECOVERED_FROM_CLIP'))
                 self.assertIsNone(monitor.active)
                 self.assertTrue(any(kind == 'captured' for kind, _ in emitted))
                 self.assertTrue((Path(tmp)/'report.pdf').is_file())
                 self.assertGreater(len(reaction_counts), 20)
-                self.assertEqual(1, len(set(reaction_counts)), 'Acid inference must stop throughout reaction capture')
+                self.assertLessEqual(max(reaction_counts)-min(reaction_counts),12,
+                                     'Reaction may use only bounded area-measurement inference')
+                self.assertEqual(1,sum(kind=='acid_detection' and payload.get('detected',False)
+                                       for kind,payload in emitted),'Application must latch only once')
+                self.assertEqual('ESTIMATED_PERSISTENT_VISUAL_ACID_AREA',record['acid_area_status'])
             finally:
                 monitor.pool.shutdown(wait=True, cancel_futures=True)
                 monitor.detector_pool.shutdown(wait=True, cancel_futures=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
 

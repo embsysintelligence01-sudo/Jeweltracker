@@ -10,6 +10,7 @@ from new_rub_detection.geometry import project_mask, stone_surface
 from new_rub_detection.photo_worker import create_session, detect_mask
 from stone_onnx import StoneOnnxModel
 from auto_testing import StoneSettling
+from int8_models import RUBBED_MODEL, RubbedMarkDetector
 
 
 def mask_box(mask):
@@ -28,9 +29,14 @@ def clear_surface(frame, stone_mask):
 
 
 class RubPhotoModels:
-    """Shared INT8 stone model and lazy rubbed-mask model for sparse captures."""
+    """Shared INT8 stone and lazy INT8 mark detector for sparse captures."""
+    mark_evidence_kind = RubbedMarkDetector.evidence_kind
+
     def __init__(self, model_dir=None):
         self.directory = Path(model_dir or Path(__file__).parent / 'new_rub_detection/models')
+        self.rub_model_path = self.directory / 'rubbedmask.onnx' if model_dir is not None else RUBBED_MODEL
+        if model_dir is not None:
+            self.mark_evidence_kind = 'SEGMENTATION'
         self.lock = threading.RLock()
         self.stone_model = self.rub_session = None
         self.roi = None
@@ -53,7 +59,10 @@ class RubPhotoModels:
     def marks(self, frame):
         with self.lock:
             if self.rub_session is None:
-                self.rub_session = create_session(self.directory / 'rubbedmask.onnx')
+                self.rub_session = (RubbedMarkDetector(self.rub_model_path) if self.rub_model_path.suffix == '.xml'
+                                    else create_session(self.rub_model_path))
+            if isinstance(self.rub_session, RubbedMarkDetector):
+                return self.rub_session.regions(frame)
             return detect_mask(frame, self.rub_session)
 
     def surface(self, frame):
@@ -117,6 +126,9 @@ class RubCycle:
         result['photo'] = draw_acid_roi(frame.copy(), projected)
         target = RubTarget(result['new_mask'], frame.shape, projected, quad,
                            self.before_result, result)
+        target.metadata['rubbed_model'] = str(vars(self.models).get('rub_model_path', RUBBED_MODEL))
+        target.metadata['rubbed_region_kind'] = vars(self.models).get('mark_evidence_kind',
+            getattr(type(self.models), 'mark_evidence_kind', 'SEGMENTATION'))
         return result, target
 
 
@@ -206,7 +218,8 @@ class RubTarget:
                              old_mark_count=before['old_mark_count'],
                              new_mark_count=after['new_mark_count'],
                              new_coverage=after['coverage'],
-                             rubbed_model='rubbedmask.onnx', stone_model='INT8_openvino_model/best.xml',
+                             rubbed_model=str(RUBBED_MODEL), stone_model='INT8_openvino_model/best.xml',
+                             rubbed_region_kind=RubbedMarkDetector.evidence_kind,
                              stone_geometry='mask_derived_oriented_quad',
                              acid_region_mode='fixed_after_new_rub')
         self.evidence = dict(before_rubbing=before['photo'].copy(), after_rubbing=after['photo'].copy(),

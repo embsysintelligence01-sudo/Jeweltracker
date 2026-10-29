@@ -100,6 +100,7 @@ class FreshnessTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 record=monitor.tests[0]
                 self.assertFalse(record['capture_complete'])
                 self.assertIsNone(record['acid_onset'])
@@ -110,6 +111,7 @@ class FreshnessTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True,cancel_futures=True)
                 monitor.detector_pool.shutdown(wait=True,cancel_futures=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
     def test_new_acid_elsewhere_keeps_model_output_and_saves_both_locations(self):
@@ -118,6 +120,8 @@ class FreshnessTests(unittest.TestCase):
             classifier.predict.return_value=dict(prediction='non_gold',confidence=.95)
             monitor=ContinuousMonitor(tmp,lambda:None,Photos(),Mock(),lambda *a,**k:None)
             monitor.detector,monitor.classifier=Detector(),classifier
+            monitor.rub_observer=lambda frame,stone: dict(box=(128,107,143,139),mask=np.ones((32,15),np.uint8),
+                origin=(128,107),c=np.array([135.,123.]),kind='SEGMENTATION')
             monitor.acid_history.remember([OLD],QUAD)
             try:
                 for i in range(135):
@@ -134,6 +138,7 @@ class FreshnessTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True)
                 monitor.detector_pool.shutdown(wait=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 r=monitor.tests[0]
                 self.assertEqual('non_gold',r['prediction']['prediction'])
                 self.assertTrue(r['capture_complete'])
@@ -149,6 +154,7 @@ class FreshnessTests(unittest.TestCase):
                 monitor.pool.shutdown(wait=True,cancel_futures=True)
                 monitor.detector_pool.shutdown(wait=True,cancel_futures=True)
                 monitor.finish_pool.shutdown(wait=True)
+                monitor.report_pool.shutdown(wait=True)
                 monitor.journal.close()
 
 
@@ -195,7 +201,8 @@ class ContactRecoveryTests(unittest.TestCase):
                 self.assertLess(cv2.imread(r['rub_image']).shape[1],200)
                 self.assertTrue(all(99.4<=p['timestamp']<=100.3 for p in r['rubbing_contact_samples']))
                 r=recover_contact(journal,cycle,lambda *a:None,save)
-                self.assertEqual('CONTACT_NOT_VISIBLE',r['rubbing_contact_status'])
+                self.assertEqual('UNVERIFIED_LOCALIZED_MOTION',r['rubbing_contact_status'])
+                self.assertFalse(r['rubbing_verified'])
                 self.assertNotIn('CONFIRMED',r['rubbing_contact_status'])
                 self.assertTrue(99.4<=r['rub_timestamp']<=100.3)
             finally:journal.close()

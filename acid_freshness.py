@@ -41,37 +41,71 @@ class AcidHistory:
         self.clear_since = None
         self.clear_count = 0
         self.events = []
+        self.status = 'NO_PREVIOUS_ACID'
+        self.checked_at = None
+        self.last_sample = -float('inf')
+        self.reference_mask = np.zeros((SIZE,SIZE), bool)
 
-    def remember(self, found, quad):
+    def remember(self, found, quad, baseline=None):
         if quad is not None:
+            region=np.zeros_like(self.mask)
             for detection in found:
-                self.mask |= footprint(detection['bbox'], quad)
+                region |= footprint(detection['bbox'], quad)
+            self.remember_region(region,baseline)
+
+    def remember_region(self, region, baseline=None):
+        new=(region>0) & (self.mask==0)
+        if baseline is not None:
+            if self.dry_reference is None:self.dry_reference=baseline.copy()
+            self.dry_reference[new]=baseline[new]
+            self.reference_mask[new]=True
+        self.mask |= region
+        if np.any(region):
+            self.status='PREVIOUS_ACID_UNCERTAIN'
+
+    def snapshot(self, timestamp):
+        status=self.status
+        if np.any(self.mask) and (self.checked_at is None or timestamp-self.checked_at>2):
+            status='PREVIOUS_ACID_UNCERTAIN'
+        return dict(status=status,checked_at=self.checked_at,prior_location_known=bool(np.any(self.mask)))
 
     def observe_idle(self, frame, quad, found, timestamp, clear):
+        if timestamp<=self.last_sample:return
+        if timestamp-self.last_sample>1.5:
+            self.clear_since,self.clear_count=None,0
+        self.last_sample=timestamp
         if not clear or quad is None:
             self.clear_since, self.clear_count = None, 0
+            self.status='PREVIOUS_ACID_UNCERTAIN' if np.any(self.mask) else 'NO_PREVIOUS_ACID'
             return
         image = normalized(frame, quad)
+        self.checked_at=timestamp
         if found:
             self.remember(found, quad)
+            self.status='PREVIOUS_ACID_VISIBLE'
             self.clear_since, self.clear_count = None, 0
             return
         if not np.any(self.mask):
-            if self.dry_reference is None:
-                self.dry_reference = image.copy()
+            self.dry_reference = image.copy()
+            self.reference_mask[:]=True
+            if self.status!='VISUALLY_CLEARED':self.status='NO_PREVIOUS_ACID'
             return
         # Several negatives alone are insufficient. The former patch must also
         # resemble an observed dry reference on a clear, stable stone.
-        if self.dry_reference is None or np.mean(changed_pixels(self.dry_reference, image)[self.mask > 0]) > .15:
+        if (self.dry_reference is None or not np.all(self.reference_mask[self.mask>0])
+                or np.mean(changed_pixels(self.dry_reference, image)[self.mask > 0]) > .15):
             self.clear_since, self.clear_count = None, 0
+            self.status='PREVIOUS_ACID_UNCERTAIN'
             return
         if self.clear_since is None:
             self.clear_since = timestamp
+        self.status='CHECKING_VISUAL_CLEARANCE'
         self.clear_count += 1
         if self.clear_count >= 3 and timestamp-self.clear_since >= .6:
             self.events.append(dict(timestamp=timestamp, status='VISUALLY_CLEARED',
                                     note='Visual evidence only; chemical cleanliness is not measured.'))
             self.mask[:] = 0
+            self.status='VISUALLY_CLEARED'
             self.clear_since, self.clear_count = None, 0
 
 

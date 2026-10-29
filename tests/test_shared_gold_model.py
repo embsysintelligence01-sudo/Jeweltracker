@@ -13,7 +13,7 @@ import jewel_tracker_5 as tracker
 
 class SharedGoldTests(unittest.TestCase):
     def test_one_backend_serializes_tracking_and_rubbing_calls(self):
-        with patch.object(tracker,'YOLO') as yolo:
+        with patch.object(tracker,'OpenVINOYolo') as yolo:
             model=tracker.SharedGoldModel()
             self.addCleanup(model.close)
             active=0
@@ -32,7 +32,7 @@ class SharedGoldTests(unittest.TestCase):
                 second=pool.submit(model.predict,np.zeros((320,320,3),np.uint8),imgsz=320,conf=.70)
                 self.assertEqual(.15,first.result())
                 self.assertEqual(.70,second.result())
-            yolo.assert_called_once_with(tracker.MODEL_PATH,task='segment')
+            yolo.assert_called_once_with(tracker.MODEL_PATH,task='segment',imgsz=320)
             self.assertEqual(1,peak)
 
     def test_worker_passes_the_same_model_to_rubbing(self):
@@ -51,7 +51,7 @@ class SharedGoldTests(unittest.TestCase):
             self.assertIs(worker.model,shared.return_value)
             self.assertEqual(worker.stone_box,rubbing.call_args.args[0])
             self.assertEqual(tracker.MODEL_PATH,tracker.RUB_GOLD_MODEL_PATH)
-            self.assertEqual('rojeweltrack.onnx',Path(tracker.MODEL_PATH).name)
+            self.assertEqual('gold_int8.xml',Path(tracker.MODEL_PATH).name)
 
     def test_real_full_frame_model_output_is_reused_for_stone_masking(self):
         model=tracker.SharedGoldModel()
@@ -61,7 +61,8 @@ class SharedGoldTests(unittest.TestCase):
         result=model.predict(frame,imgsz=640,conf=tracker.CONF,device='cpu',verbose=False)[0]
         self.assertIsNotNone(result.boxes)
         self.assertEqual({0:'gold'},result.names)
-        self.assertEqual([320,320],model.backend.predictor.imgsz)
+        self.assertEqual(320,model.backend.imgsz)
+        self.assertTrue(model.backend.quantized)
         stone_model=tracker.StoneOnnxModel(tracker.STONE_MODEL_PATH)
         stone=tracker.StoneWatcher(None,stone_model,lambda:None).model_box(frame)
         self.assertIsNotNone(stone)
@@ -70,7 +71,7 @@ class SharedGoldTests(unittest.TestCase):
         if evidence is not None:
             self.assertEqual(2,len(evidence['c']))
             self.assertGreater(evidence['mask'].sum(),0)
-        self.assertEqual(['CPUExecutionProvider'],model.backend.predictor.model.session.get_providers())
+        self.assertIn('CPU',model.backend.compiled.get_property('EXECUTION_DEVICES'))
 
 
 if __name__=='__main__':unittest.main()

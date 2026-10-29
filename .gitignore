@@ -25,6 +25,7 @@ dist/
 *.pyz
 
 # Python environments and caches
+.venv-slic/
 .venv/
 venv/
 __pycache__/

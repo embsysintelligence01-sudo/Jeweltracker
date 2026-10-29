@@ -1,0 +1,10 @@
+{
+  "precision": "INT8",
+  "names": [
+    "gold"
+  ],
+  "task": "segment",
+  "source": "models\\onnx\\gold.onnx",
+  "calibration": "300 frames from D:/Embsys/Jewelry_Seg/dataset_v1/train/images",
+  "trained_from": "gold.pt (YOLOv8s-seg, imgsz 320, jewelry-seg-nrnct dataset v1, 100 epochs)"
+}

@@ -1,0 +1,6 @@
+{
+  "acid_inactivity_seconds": 12.0,
+  "next_pickup_debounce_seconds": 0.3,
+  "max_recovery_acid_frames": 60,
+  "max_recovery_contact_frames": 24
+}

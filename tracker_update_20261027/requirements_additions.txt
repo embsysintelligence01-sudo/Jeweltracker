@@ -1,0 +1,6 @@
+﻿Packages the update needs on top of requirements.txt (jewel_identity.py):
+  faiss-cpu
+  scikit-image
+  scikit-learn
+  opencv-contrib-python   (cv2.ximgproc superpixels; replaces opencv-python, do not install both)
+Model files: none new. Uses the existing weights\resnet18_features.onnx.

@@ -3,6 +3,40 @@
 Application folder: `/home/embsys/Desktop/jewel_tracker/jewel_tracker`.
 Python environment: `.venv` (Python 3.10, CPU PyTorch).
 
+Version 5 now uses `int_8_GOLD_JEWEL/gold_int8.xml` and its companion `.bin`
+for jewellery segmentation (320x320), and
+`INT_8_RUBBEDMASK/rubbedmask_det_v3_int8.xml` plus `.bin` for mark detection
+(640x640). Both run through OpenVINO on CPU with two inference threads and
+one stream, reusing loaded sessions. The jewellery pass still supplies live
+tracking and gold-on-stone contact together. Acid and stone models are unchanged.
+
+The supplied rubbed-mark export is a **box detector**, not a segmentation model.
+Its candidate rectangles go through the existing stone-relative before/after
+change, old-mark exclusion, clear-frame persistence and contact-location checks.
+The resulting changed region is not a model-generated pixel segmentation;
+the audit records this as `DETECTION_BOX_WITH_BEFORE_AFTER_CHANGE`.
+The PDF's new-mark panel shows the rubbed region without the jewellery-contact
+outline; the separate contact panel keeps its contact evidence.
+
+Acid detections now start a provisional recording/verification stage. One
+freshness-qualified model observation seeds a candidate; subsequent fresh
+camera frames perform lightweight checks in stone-relative coordinates without
+another model pass. Two distinct clear observations, at least 30 ms apart,
+must show a persistent changed patch with low local movement. Skin/glare,
+unknown pose, broad surface change and straight elongated tool-like changes
+prevent confirmation. A stationary needle-like line is not accepted merely
+because it stopped moving. This is a visual heuristic, not a needle model or
+proof of chemistry.
+
+The timestamped journal keeps recording throughout. Candidates have a five-second
+verification window; rejected candidates leave acid search active, with no manual
+handoff. A confirmed application is latched once and its reaction ends five seconds
+after the first supported clear-patch frame. If the onset was obscured, the report
+records that timing limitation rather than using an unverified needle timestamp.
+Live verification and bounded recorded recovery apply the same checks. Candidate
+events, verification/onset times and provisional video links are included in the
+audit. At most two candidate states and sixty audit events are retained per cycle.
+
 ## Run
 
 The tracker now opens in **continuous capture** mode. Configure the bench ROI
@@ -28,6 +62,18 @@ the cycle; a cycle already in progress continues through later hand coverage.
 The full session recording and under-hand visibility notes remain available.
 `PICKUP_STATES` in `continuous_testing.py` currently contains only `IN_HAND`.
 
+Gold-on-stone contact acceptance is scoped to that recording cycle. With jewels
+resting on the bed, the loaded jewellery model continues ID tracking, but its
+stone polygons are not interpreted as rubbing contact. A pickup begins a fresh
+contact/movement history. Contacts from another cycle or an inference started
+before the gate opened are rejected. A jewel appearing back on the bed immediately
+suppresses new contact updates; two distinct fresh return observations spanning
+at least 120 ms confirm the return and close the gate. Confirmed new masks,
+baseline start (including a failed-mask decision), acid capture, cycle completion
+and reset also close it. The best saved contact photo/mask stays frozen. Only
+the next pickup cycle can reopen acceptance; recorded contact recovery observes
+the same closing timestamp. No new model is loaded at pickup.
+
 The before-stone reference now starts as soon as a clear stone is available,
 including while initial IDs are still being assigned. Its image is saved under
 the session's `references/` folder, shown in the side panel and included in the
@@ -43,18 +89,26 @@ stone whose texture cannot be aligned; its orientation through complete
 occlusion remains an assumption recorded in the manifest. Missing evidence never
 asks the operator to repeat the process.
 
-One qualifying fresh-acid detection at confidence 0.60 stops further acid detection for that jewel
-and triggers five seconds from its **camera frame timestamp**. The reaction is
+One qualifying fresh-acid detection at confidence 0.60 seeds a provisional candidate.
+After clear-patch verification, further acid detection stops for that jewel
+and reaction timing uses the first supported **camera frame timestamp**. The reaction is
 then classified and the jewel's DONE indicator stays visible during the next
-test. When acid is not detected, the current session stays active without a
-timeout, including when another jewel is handled. Only an explicit session
-stop/reset ends that wait without detection. Recorded-frame recovery also runs
+test. When acid is not confirmed, its search closes at a reliably observed next
+jewel pickup (0.3-second debounce and distinct fresh detections), or after 12
+seconds of genuine SOP inactivity. The last jewel also finalizes automatically.
+Fresh camera frames drive the inactivity timer; stream gaps do not count.
+Meaningful movement on the stone and supported rubbing reset that timer;
+stationary residue and repeated model misses do not. These values are configurable
+in `sop_config.json`. J1's final recovery is detached from J2's live processing;
+J1's recovery interval ends at J2's first reliable pickup, excluding J2's footage. Recorded-frame recovery also runs
 while waiting and can confirm an application missed live. Acid inference uses a
 padded stone crop. Failed live rubbing,
 mask and acid checks are recovered from the recorded sequence in a background
 worker. Pre-acid frames alone can establish a new rubbing mask. Two seconds
 before detected onset and five seconds after it are exported with timestamp
-sidecars; incomplete footage, coverage and wiping are recorded separately. A
+sidecars; incomplete footage, coverage and wiping are recorded separately.
+A source-frame gap or insufficient usable reaction coverage prevents material
+classification; the report preserves the acid event and explains the missing result. A
 two-second video buffer does not guarantee two clear baseline seconds. Models,
 thresholds and classifier preprocessing are unchanged; the faster temporal capture
 protocol still requires field validation on labelled sequences.
@@ -65,7 +119,7 @@ recovery and final export. Unchanged baseline patches and detections overlapping
 previous acid do not start another timer. A new detector footprint must have a
 localized appearance change outside remembered acid, with recent known stone
 geometry. The present detector cannot establish a new dose in an already wet
-patch; that case keeps waiting with an explicit note. It adds no fixed wait and
+patch; that case stays unconfirmed until handoff/inactivity closes the search. It adds no fixed wait and
 does not request a repeat. Footprints use boxes rather than chemical masks;
 camera/stone orientation through complete occlusion remains an assumption.
 
@@ -82,6 +136,36 @@ stone close-up with the visible gold marked. Back-and-forth motion is required
 to call rubbing recovered. Contact-only and not-visible cases are distinguished;
 a new mark alone is not proof of visible rubbing contact. Photos include source
 frame timestamps. Background work samples at most 24 frames per jewel.
+
+The live UI has separate timestamped **Rubbing contact** and **New rubbing mask**
+panels. Contact boxes/masks originate from the same immutable frame used by live
+jewellery inference; later preview frames cannot substitute for that source.
+The contact mask, origin, box, source frame and time are saved per cycle.
+
+Recorded recovery tries jewellery segmentation, then an in-stone jewellery box
+from the same inference, then localized image movement. Box-only and motion-only
+fallbacks are unverified. New marks need three distinct clear observations spanning
+at least 0.12 seconds, remain within the stone and fixed test ROI, exclude old
+marks, and overlap a segmentation-supported contact region. Unrelated candidates
+are rejected; missing contact leaves the candidate unverified. Baseline/acid
+capture continues after the one-second mask decision target without a manual retry.
+The same checks apply during final video recovery. A new mark alone never verifies
+rubbing motion.
+
+The visual PDF follows the proposed audit layout: session overview, one visual
+page per test, then full-detail appendices. It includes the original jewellery,
+contact, verified/rejected candidate mark, acid placement and first/final usable
+reaction frames. Audit outcomes are EVIDENCE VERIFIED, REVIEW REQUIRED, or
+INCOMPLETE; material predictions remain separate. Missing frames use explicit
+placeholders and every warning/timestamp remains available in the appendix and
+JSON. No model or retraining is added.
+
+Final contact recovery samples at most 24 frames and acid recovery at most 60.
+The live model dispatcher retains bench priority. Two finalization snapshots can
+wait in RAM; overload is serialized to a private session-local recovery spool,
+which the single recovery worker drains. PDF writes run in one separate worker
+with coalesced requests. Cycle tokens plus ROI/reset generations prevent late
+jobs from overwriting a different cycle, even when jewel IDs are reused.
 
 The PDF includes a same-frame comparison: magenta new-rub contour and cyan acid
 detector footprint, with the overlap status and a warning when locations differ.
@@ -180,7 +264,7 @@ For the current main-window workflow, use the continuous-capture instructions
 above; manual rubbing gates, Retake/Ready actions and per-session ResNet training
 described below are superseded in continuous mode.
 
-`rojeweltrack.onnx` serves both jewellery tracking and gold-on-stone
+`int_8_GOLD_JEWEL/gold_int8.xml` serves both jewellery tracking and gold-on-stone
 segmentation from **one unmodified full-camera-frame prediction** per live
 observation. The ROI is applied afterward for bench guarding. Stone masking
 reuses the same raw model polygons, before bench-only colour/skin filtering.
@@ -283,7 +367,8 @@ lifetime. Recorded-sequence parity checks and deployment hashes are under
 
 SigLIP2 weights, `jewel_classifier.py`, and the classification caches are
 present, but jewel-type classification is disabled in this version's worker.
-The tracker requires the supplied `rojeweltrack.onnx`; it does not fall back to a different jewellery model.
+The tracker requires the supplied `int_8_GOLD_JEWEL/gold_int8.xml` and `.bin`;
+it does not silently fall back to a different jewellery model.
 
 ## Earlier before/after rubbing guidance and acid ROI
 
