@@ -15,14 +15,16 @@ def recover_contact(journal, cycle, observer, save_picture):
     # Tracking can report a return before the operator finishes rubbing. The
     # timestamped live source is stronger evidence than that return heuristic.
     # Keep it only inside this cycle and strictly before acid application.
-    valid_live=(live is not None and live.get('frame') is not None
+    valid_live=(not cycle.get('overlap_trigger_required') or cycle.get('rubbing_started_at') is not None) and (live is not None and live.get('frame') is not None
                 and start<=live['timestamp']<=cycle['finished']
                 and (cutoff is None or live['timestamp']<=cutoff)
                 and (cycle.get('acid_onset') is None or live['timestamp']<cycle['acid_onset']))
     return_precedes_contact=bool(valid_live and live['timestamp']>end)
     if valid_live:
         end=max(end,live['timestamp'])
-    entries=journal.between(start,end,fps=6)
+    armed=not cycle.get('overlap_trigger_required') or cycle.get('rubbing_started_at') is not None
+    evidence_start=max(start,(cycle.get('rubbing_started_at') or start)-.2)
+    entries=journal.between(evidence_start,end,fps=6) if armed else []
     limit=cycle.get('recovery_contact_frames',24)
     indices=np.unique(np.linspace(0,len(entries)-1,min(limit,len(entries)),dtype=int))
     observations=cycle.get('stone_observations',[])

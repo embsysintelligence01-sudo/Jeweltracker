@@ -136,10 +136,11 @@ class ApplicationVerificationTests(unittest.TestCase):
         self.assertTrue(best['bbox'][0]<150)  # original supported source, not the moved frame
         self.assertIsNone(verifier().observe(moved,QUAD+[20,15],10.04))
 
-    def test_old_acid_and_new_changed_area_elsewhere_cannot_verify_the_candidate(self):
-        v=verifier(footprint(DETECTION['bbox'],QUAD))
+    def test_baseline_patch_can_confirm_but_unrelated_patch_cannot(self):
+        v=AcidApplicationVerifier(normalized(scene(acid=True),QUAD),footprint(DETECTION['bbox'],QUAD))
         v.offer(scene(acid=True),QUAD,DETECTION,10)
-        for t in (10,10.04,10.2):self.assertIsNone(v.observe(scene(acid=True),QUAD,t))
+        self.assertIsNone(v.observe(scene(acid=True),QUAD,10))
+        self.assertIsNotNone(v.observe(scene(acid=True),QUAD,10.04))
         v=verifier();v.offer(needle(),QUAD,DETECTION,10)
         other=scene();other[105:135,180:195]=(0,255,0)
         for t in (10.1,10.2):self.assertIsNone(v.observe(other,QUAD,t))
@@ -236,7 +237,7 @@ class ApplicationFlowTests(unittest.TestCase):
                 if remaining_patch:
                     self.assertIsNotNone(best)
                     self.assertGreaterEqual(observed,100.8)
-                    self.assertEqual('STONE_RELATIVE_PERSISTENT_PATCH',best['application_verification'])
+                    self.assertEqual('DETECTOR_AND_VISIBLE_PERSISTENT_PATCH',best['application_verification'])
                 else:
                     self.assertIsNone(best)
 

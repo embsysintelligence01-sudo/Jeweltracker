@@ -18,6 +18,7 @@ class Detection:
 
 class OnnxAcidDetector:
     def __init__(self, path: Path):
+        self.path = Path(path)
         options = ort.SessionOptions()
         options.intra_op_num_threads = 2
         options.inter_op_num_threads = 1

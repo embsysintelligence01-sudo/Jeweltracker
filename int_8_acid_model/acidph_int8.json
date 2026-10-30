@@ -1,0 +1,9 @@
+{
+  "precision": "INT8",
+  "names": [
+    "acidph"
+  ],
+  "task": "obb",
+  "source": "models\\onnx\\acidph.onnx",
+  "calibration": "300 frames from C:\\Users\\jacob\\Videos\\StonePurityRecordings"
+}

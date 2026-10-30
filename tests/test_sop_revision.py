@@ -137,6 +137,9 @@ class CycleLifecycleTests(unittest.TestCase):
 
     def test_acid_image_preserves_its_original_source_instead_of_nearest_archive_sample(self):
         with monitor_case() as (m,events):
+            from test_continuous_testing import Detector
+            m.detector=Detector()
+            m._recover_acid_area=lambda *args:None
             m.classifier=Mock()
             m.classifier.predict.return_value=dict(prediction='non_gold',confidence=.95)
             m.step(snap(100,held=1))

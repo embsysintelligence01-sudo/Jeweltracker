@@ -19,13 +19,16 @@ class ContactWorkerGateTests(unittest.TestCase):
     def worker(self):
         w=app.Worker(0,[(0,0),(399,0),(399,299),(0,299)],continuous=True)
         w.mode='LOCKED'
+        w.stone_box=lambda:STONE
         w.rubber=app.RubbingObserver(lambda:STONE,lambda:w.flow_revision)
         w.gold_observation=([np.float32([[125,105],[145,105],[145,140],[125,140]])],np.array([.9]))
         return w
 
     def observe(self,w,token=None,ts=None):
+        supplied=ts is not None
         ts=time.time() if ts is None else ts
         w._observe_stone_contact(scene(),ts,STONE,w.flow_revision,token)
+        w._observe_stone_contact(scene(),ts+.0001 if supplied else time.time(),STONE,w.flow_revision,token)
 
     def test_static_bed_does_not_interpret_stone_segmentation(self):
         w=self.worker()

@@ -9,10 +9,22 @@ import numpy as np
 from acid_freshness import DEST, normalized, footprint, changed_pixels
 
 
+def visible_patch(image, support):
+    """Current local dark/coloured patch; no comparison with pre-acid pixels."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ring = (cv2.dilate(support.astype(np.uint8),np.ones((15,15),np.uint8))>0) & ~support
+    background = float(np.median(gray[ring])) if np.any(ring) else float(np.median(gray))
+    patch = support & ((gray.astype(float)<background-8) | (hsv[:,:,1]>45))
+    patch[:5]=False;patch[-5:]=False;patch[:,:5]=False;patch[:,-5:]=False
+    bright_tool = support & (gray.astype(float)>background+35) & (hsv[:,:,1]<40)
+    return patch, bright_tool
+
+
 class AcidApplicationVerifier:
     def __init__(self, baseline, old_mask, window=5., max_candidates=2):
         self.baseline = baseline.copy()
-        self.old = cv2.dilate(old_mask, np.ones((9, 9), np.uint8)) > 0
+        # Historical locations must not exclude evidence of a new application.
         self.window, self.max_candidates = window, max_candidates
         self.pending = []
         self.events = []
@@ -69,7 +81,6 @@ class AcidApplicationVerifier:
             return None
         self.last_ts = timestamp
         image = normalized(frame, quad) if quad is not None and geometry_known else None
-        changed = changed_pixels(self.baseline, image) if image is not None else None
         if image is not None:
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             skin = (hsv[:, :, 0] <= 14) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] > 80)
@@ -83,24 +94,20 @@ class AcidApplicationVerifier:
                 self._drop(candidate)
                 continue
             support = cv2.dilate(candidate['seed'].astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+            patch, tool = visible_patch(image,support) if image is not None else (None,None)
             reason = None
             if image is None or not clear:
                 reason = 'VISIBILITY_OR_GEOMETRY_UNCERTAIN'
             elif (float(skin[support].mean()) > .2 or float(light[support].mean()) > .8):
                 reason = 'HAND_OR_GLARE_OVER_CANDIDATE'
-            elif changed.mean() > .3:
-                reason = 'BROAD_SURFACE_CHANGE'
-            elif self._tool_like(changed, support):
+            elif self._tool_like(tool, support):
                 reason = 'APPLICATOR_LIKE_CHANGE_REMAINS'
             if reason is not None:
                 candidate.update(count=0, first=None, previous=None, patch=None, reason=reason)
                 continue
-            patch = changed & support & ~self.old
-            patch[:5] = False; patch[-5:] = False
-            patch[:, :5] = False; patch[:, -5:] = False
             if patch.sum() < 5:
                 candidate.update(count=0, first=None, previous=None, patch=None,
-                                 reason='NO_PERSISTENT_NEW_PATCH')
+                                 reason='NO_VISIBLE_PATCH')
                 # A disappeared tool is not an acid application.
                 if not np.any(patch) and timestamp - candidate['timestamp'] >= .1:
                     self._event('CANDIDATE_DISAPPEARED', timestamp, candidate)
@@ -149,11 +156,13 @@ class AcidApplicationVerifier:
             if candidate['count'] >= 2 and timestamp-first['timestamp'] >= .03:
                 status = ('VISIBLE_PATCH_ONSET' if first['timestamp']-candidate['timestamp'] <= .15
                           else 'ONSET_OBSCURED_USING_FIRST_CLEAR_PATCH')
+                if candidate['detection'].get('freshness_warning'):
+                    status = 'PATCH_OBSERVATION_TIME_FRESH_APPLICATION_UNVERIFIED'
                 best = dict(candidate['detection'], **first,
                             application_candidate_at=candidate['timestamp'],
                             application_verified_at=timestamp,
                             application_timing_status=status,
-                            application_verification='STONE_RELATIVE_PERSISTENT_PATCH',
+                            application_verification='DETECTOR_AND_VISIBLE_PERSISTENT_PATCH',
                             clear_patch_frames=candidate['count'])
                 self._event('APPLICATION_VERIFIED', timestamp, candidate, onset=first['timestamp'])
                 self.pending.clear()

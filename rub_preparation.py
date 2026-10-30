@@ -57,13 +57,23 @@ class RubPhotoModels:
             return stone_mask, self.marks(frame), quad
 
     def marks(self, frame):
+        return self.mark_observation(frame)[0]
+
+    def mark_observation(self, frame):
+        """Return candidate rectangles with their frame, using one inference."""
         with self.lock:
             if self.rub_session is None:
                 self.rub_session = (RubbedMarkDetector(self.rub_model_path) if self.rub_model_path.suffix == '.xml'
                                     else create_session(self.rub_model_path))
             if isinstance(self.rub_session, RubbedMarkDetector):
-                return self.rub_session.regions(frame)
-            return detect_mask(frame, self.rub_session)
+                return self.rub_session.regions_with_boxes(frame)
+            mask=detect_mask(frame, self.rub_session)
+            contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            boxes=[]
+            for contour in contours:
+                x,y,w,h=cv2.boundingRect(contour)
+                boxes.append((x,y,x+w,y+h))
+            return mask, boxes
 
     def surface(self, frame):
         with self.lock:
@@ -249,9 +259,11 @@ def render_rub_preview(result, show_existing_marks=False):
 
 def draw_acid_roi(image, mask):
     contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(image, contours, -1, (255, 0, 255), 2)
+    for contour in contours:
+        x,y,w,h=cv2.boundingRect(contour)
+        cv2.rectangle(image,(x,y),(x+w-1,y+h-1),(255,0,255),2)
     if contours:
         x, y, _, _ = cv2.boundingRect(max(contours, key=cv2.contourArea))
-        cv2.putText(image, 'NEW RUB / ACID ROI', (x, max(20, y-8)), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(image, 'NEW RUB DETECTION', (x, max(20, y-8)), cv2.FONT_HERSHEY_SIMPLEX,
                     .6, (255, 0, 255), 2)
     return image

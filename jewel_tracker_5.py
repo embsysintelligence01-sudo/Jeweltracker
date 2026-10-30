@@ -1,6 +1,6 @@
 """Jewel Guard: continuous jewel tracking, rubbing and acid evidence capture.
 
-Run ./run_tracker.sh. Draw the bench ROI and, optionally, the stone test-position
+Run ./run_tracker_slic.sh for version 6 SLIC identity tracking. Draw the bench ROI and, optionally, the stone test-position
 ROI once. Initial IDs/crops have a two-second target. In-hand/under-hand history
 associates a rubbing cycle; a completely lost track is reported as missed.
 Timestamped frames are recorded independently of model speed. New rubbing masks
@@ -77,6 +77,7 @@ from acid_test.integration import AcidTestThread, AcidModelCache
 from live_pipeline import InferenceDispatcher, StaleInference, LatestPreview
 from stone_onnx import StoneOnnxModel
 from int8_models import OpenVINOYolo
+from jewel_identity import IdentityMatcher
 from rub_preparation import RubPhotoModels, RubCycle, StoneCleanup, draw_acid_roi, render_rub_preview
 from auto_testing import StoneSettling
 from continuous_testing import ContinuousMonitor, draw_workflow, PHASE_TITLES
@@ -245,6 +246,8 @@ ID_CROP_PAD = 0.12         # crop = detection box plus this share around it
 RESNET18_FILE = "resnet18-f37072fd.pth"  # torchvision's ImageNet ResNet18, kept in weights\ ...
 RESNET18_ONNX = "resnet18_features.onnx"  # ... and exported without its last layer (512 features) for
                                           # onnxruntime: 20 ms per crop vs 34 ms in torch, same output
+APP_MOVING_PX = 250        # version 6 signature mismatch cost
+SIG_VETO_MARGIN = 0.30     # version 6 contested identity veto
 ID_CROP_MAX = 256          # crops are shrunk to this first (ResNet18 sees 224 px): turning a 1000 px necklace crop
                            # made training take 25 s
 MOVE_EMA = 0.4             # movement score: smoothed centre jitter (px per frame); the rubbed jewel moves most
@@ -595,7 +598,7 @@ class RTSPGrabber(threading.Thread):
 
 # ---------------- tracking ----------------
 class Det:
-    __slots__ = ("box", "c", "area", "conf", "gold", "mask", "origin", "app", "stable_since", "idres")
+    __slots__ = ("box", "c", "area", "conf", "gold", "mask", "origin", "app", "stable_since", "idres", "sig")
 
     def __init__(self, box, c, area, conf, gold=1.0, mask=None, origin=(0, 0)):
         self.box, self.c, self.area, self.conf, self.gold = box, c, area, conf, gold
@@ -603,6 +606,7 @@ class Det:
         self.app = None  # appearance fingerprint, filled in when needed
         self.stable_since = None  # standing still since (set by the worker)
         self.idres = None         # (jewel id or None, probability) from the ID model, once it is stable
+        self.sig = None           # version 6 SLIC scores for contested detections
 
 
 def touching(a, b, gap):
@@ -1259,8 +1263,13 @@ class Worker(QtCore.QThread):
         self.rub_reference_ready = False
         self.rub_cycle_id = 0
         self.stone_cleanup_pending = False
+        self.identity_training_lock = threading.Lock()
+        self.identity_training_token = None
+        self.identity_extractor = None
+        self.identity_slic = (hasattr(cv2, 'ximgproc') and hasattr(cv2.ximgproc, 'createSuperpixelSLIC'))
         try:
-            self.id_model = None if continuous else JewelIdModel()  # continuous mode uses hand-history association
+            self.id_model = (IdentityMatcher(None) if self.identity_slic else
+                             None if continuous else JewelIdModel())
         except Exception as e:
             self.id_model = None
             print(f"[jewel ID model] not available: {e}")
@@ -1357,6 +1366,10 @@ class Worker(QtCore.QThread):
     # ---- worker thread ----
     def run(self):
         self.status.emit("Loading model...")
+        if self.identity_slic:
+            self.event.emit("Tracking: version 6 identity gallery + SLIC; preparation runs in background", "info")
+        elif self.continuous_enabled:
+            self.event.emit("SLIC identity matching unavailable here; run ./run_tracker_slic.sh for version 6 tracking", "info")
         try:
             model = self.model = SharedGoldModel(MODEL_PATH)
             self.event.emit("Jewellery: int_8_GOLD_JEWEL/gold_int8.xml | OpenVINO CPU, INT8, 320, 2 threads", "info")
@@ -1513,6 +1526,8 @@ class Worker(QtCore.QThread):
     def _close_stone_contact(self):
         # Caller owns worker.lock. Saved per-jewel/UI evidence is left intact.
         self.continuous_contact_token = None
+        self.continuous_overlap_probe = None
+        self.continuous_overlap_trigger = None
         self.rub_ev, self.rubbing_now = None, False
         if self.rubber is not None:
             self.rubber.active = False
@@ -1530,6 +1545,33 @@ class Worker(QtCore.QThread):
                 self.rubber.suspend(ts)
                 self.rub_ev, self.rubbing_now = None, False
                 return
+            # Arm evidence only from two distinct, current gold/stone overlaps.
+            # Pickup tracking and the rolling recorder remain independent.
+            if getattr(self,'continuous_overlap_trigger',None) is None:
+                ev=(rubbing_evidence(*self.gold_observation,frame.shape,captured_stone)
+                    if captured_stone is not None and revision==self.flow_revision
+                    and 0<=time.time()-ts<=LIVE_RESULT_MAX_AGE_S
+                    and stone_observation_matches(captured_stone,self.stone_box()) else None)
+                if ev is not None:
+                    sx1,sy1,sx2,sy2=map(int,captured_stone)
+                    margin=max(3,int(.03*min(sx2-sx1,sy2-sy1)))
+                    ox,oy=ev['origin'];mask=ev['mask']
+                    x1,y1=max(0,sx1+margin-ox),max(0,sy1+margin-oy)
+                    x2,y2=min(mask.shape[1],sx2-margin-ox),min(mask.shape[0],sy2-margin-oy)
+                    if x2<=x1 or y2<=y1 or np.count_nonzero(mask[y1:y2,x1:x2])<RUB_MIN_MASK_PX:
+                        ev=None
+                previous=getattr(self,'continuous_overlap_probe',None)
+                if ev is None:
+                    self.continuous_overlap_probe=None
+                elif previous is not None and 0<ts-previous['last']<=.5:
+                    self.continuous_overlap_trigger=dict(timestamp=previous['start'],confirmed_at=ts,
+                        cycle_token=contact_token,box=tuple(ev['box']),frames=2)
+                elif previous is None or ts>previous['last']:
+                    self.continuous_overlap_probe=dict(start=ts,last=ts)
+                if getattr(self,'continuous_overlap_trigger',None) is None:
+                    self.rubber.suspend(ts)
+                    self.rub_ev,self.rubbing_now=None,False
+                    return
             self.rubber.active = True
         else:
             self.rubber.active = (self.mode == "LOCKED" and self.acid_pending_id is None
@@ -1550,6 +1592,8 @@ class Worker(QtCore.QThread):
         with self.lock:
             return dict(frame=frame, timestamp=ts, mode=self.mode, revision=self.flow_revision,
                 stone=self.stone_box(), placement=self.test_roi,
+                overlap_trigger_required=True,
+                rubbing_trigger=getattr(self,'continuous_overlap_trigger',None),
                 contact=(dict(self.rub_ev, confirmed=bool(self.rubbing_now),
                               area=int(np.count_nonzero(self.rub_ev['mask'])))
                          if self.rub_ev is not None and self.rub_ev.get('frame') is not None else None),
@@ -1612,7 +1656,7 @@ class Worker(QtCore.QThread):
                     return
                 self.continuous_target_uncertain = payload.get('uncertain', False)
                 if payload.get('mask') is not None:
-                    self.continuous_mask = dict(mask=payload['mask'], stone=payload['stone'])
+                    self.continuous_mask = dict(mask=payload.get('display_mask',payload['mask']), stone=payload['stone'])
                     if tr is not None:
                         tr.acid_roi_mask, tr.acid_roi_stone = payload['mask'], payload['stone']
                 if kind == 'mask':
@@ -1821,20 +1865,45 @@ class Worker(QtCore.QThread):
             self.event.emit("Touchstone not found yet: rubbing can't be checked", "info")
 
     def learn_ids(self, frame):
-        """Train the per-session ID model from the jewels as captured (in the background, a few seconds)."""
+        """Build the version 6 gallery in the background; publish only to its own batch."""
         crops = {tr.id: crop_box(frame, tr.box).copy() for tr in self.tracks}
+        negatives = self.negative_crops(frame)
+        revision = self.flow_revision
+        token = object()
+        self.identity_training_token = token
         self.id_model.ready = False
+        slic = self.identity_slic
+        old_model = self.id_model
 
         def train():
             t0 = time.time()
             try:
-                negatives = self.negative_crops(frame)
-                acc = self.id_model.train(crops, negatives)
-                self.event.emit(f"Jewel IDs learned (ResNet18, {len(crops)} jewels + bench/stone, "
-                                f"{time.time() - t0:.0f} s, self-check {acc:.0%})", "info")
-            except Exception as e:
-                self.event.emit(f"Jewel ID model could not be trained: {e}", "alert")
-        self.id_training_thread = threading.Thread(target=train, daemon=True)
+                with self.identity_training_lock:
+                    if self.identity_training_token is not token or self.flow_revision != revision:
+                        return
+                    if slic:
+                        if self.identity_extractor is None:
+                            self.identity_extractor = JewelIdModel()
+                        candidate = IdentityMatcher(self.identity_extractor)
+                    else:
+                        candidate = old_model
+                    acc = candidate.train(crops, negatives)
+                    with self.lock:
+                        if (self.identity_training_token is not token or self.flow_revision != revision
+                                or not self.running or [tr.id for tr in self.tracks] != sorted(crops)):
+                            return
+                        self.id_model = candidate
+                        self.prev_stable = []
+                        for det in self.prev_dets:
+                            det.idres, det.sig = None, None
+                    details = (f"SLIC + identity gallery, {candidate.check_answered:.0%} self-check answered"
+                               if slic else "ResNet18")
+                    self.event.emit(f"Jewel IDs learned ({details}, {len(crops)} jewels, "
+                                    f"{time.time()-t0:.1f} s, self-check {acc:.0%})", "info")
+            except Exception as exc:
+                if self.identity_training_token is token and self.flow_revision == revision:
+                    self.event.emit(f"Jewel identity gallery unavailable: {exc}", "alert")
+        self.id_training_thread = threading.Thread(target=train, name='jewel-identity-gallery', daemon=True)
         self.id_training_thread.start()
 
     def negative_crops(self, frame, n=ID_NEG_SAMPLES):
@@ -1981,6 +2050,8 @@ class Worker(QtCore.QThread):
         ready = self.id_model is not None and self.id_model.ready and frame is not None
         # 1: jewels seen a moment ago -> by position (Hungarian on distance + size)
         active = [i for i, tr in enumerate(self.tracks) if t - tr.det_seen < TRACK_KEEP_S]
+        if ready and isinstance(self.id_model, IdentityMatcher):
+            self.score_contested(dets, active, frame, t)
         for i, j in self.assign(active, free, dets, t, self.motion_cost):
             match[i] = j
             free.remove(j)
@@ -2034,25 +2105,21 @@ class Worker(QtCore.QThread):
         # closed world: if only one jewel is out of sight, a still, unclaimed box on the bench that the ID model does
         # not call "not a jewel" is that jewel (16-10: an earring put down a little away was left unclaimed)
         lost = [i for i in range(len(self.tracks)) if i not in match]
-        recent_hand_return = (self.continuous_enabled and len(lost) == 1
-                              and t-getattr(self.tracks[lost[0]], 'hand_last', -1e9) <= 15)
-        if len(lost) == 1 and (ready or recent_hand_return):
+        if ready and len(lost) == 1:
             tr = self.tracks[lost[0]]
             cands = []
             for j in free:
                 d = dets[j]
-                stable_return = (d.stable_since is not None and t-d.stable_since >= .10) if recent_hand_return else self.is_stable(d, t)
-                if (not stable_return or self.roi_dist(d.c) <= 0 or self.on_stone(d.c, margin=0)
+                if (not self.is_stable(d, t) or self.roi_dist(d.c) <= 0 or self.on_stone(d.c, margin=0)
                         or not 0.25 <= d.area / max(tr.area, 1.0) <= 4.0):
                     continue
-                if ready:
-                    jid, p = self.identify(frame, d)
-                    if jid is None and p >= ID_MIN_PROB:
-                        continue
-                    if jid is not None and jid != tr.id and p >= ID_MIN_PROB:
-                        continue
+                jid, p = self.identify(frame, d)
+                if jid is None and p >= ID_MIN_PROB:
+                    continue  # the model is sure it is not a jewel
+                if jid is not None and jid != tr.id and p >= ID_MIN_PROB:
+                    continue  # the model is sure it is another jewel
                 cands.append(j)
-            if cands and (ready or len(cands) == 1):
+            if cands:
                 j = min(cands, key=lambda j: float(np.hypot(*(dets[j].c - tr.pos))))
                 match[lost[0]] = j
                 free.remove(j)
@@ -2111,6 +2178,24 @@ class Worker(QtCore.QThread):
         hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
         skin = (hsv[:,:,0] <= SKIN_H_MAX) & (hsv[:,:,1] >= SKIN_S_MIN) & (hsv[:,:,2] > 60)
         return np.count_nonzero(skin & contact) >= max(60, .12*np.count_nonzero(contact))
+
+    def score_contested(self, dets, active, frame, t):
+        """A box that could be one of several jewels is scored against every jewel by the superpixel signature
+        (~9 ms), so the matching can tell them apart while they move (rubbing): when two or more followed jewels
+        could claim it by position, or when a jewel is out of sight (in the hand, longer than TRACK_KEEP_S it is no
+        longer followed, and the jewel still being followed would take its box when it comes back: 16-10, 26-10).
+        With every jewel seen and one claimant per box there is nothing to confuse."""
+        someone_missing = len(dets) < len(self.tracks) or len(active) < len(self.tracks)
+        for d in dets:
+            d.sig = None
+            claimants = sum(1 for i in active if self.gate_dist(self.tracks[i], d, t)[1])
+            if len(self.tracks) >= 2 and (claimants >= 2 or (claimants >= 1 and someone_missing)):
+                d.sig = self.id_model.signature_scores(crop_box(frame, d.box))
+            if claimants >= 1 and someone_missing and len(self.tracks) >= 2:
+                # a jewel is out of sight: the full verdict (FAISS gallery + superpixels, answers only when sure)
+                # decides whether this box may be taken by a jewel that was seen all along. Cached while the box
+                # stands still (mark_stable keeps it), so only a moving box pays ~25 ms per frame.
+                self.identify(frame, d)
 
     def update_motion(self, frame, t):
         """Is anything (a hand) moving over the bench? Sets self.still_since (None while moving)."""
@@ -2243,7 +2328,16 @@ class Worker(QtCore.QThread):
                 jid, p = self.identify(self.cur_frame, d)
                 if jid != tr.id:
                     return 1e9
-        return dist + SIZE_WEIGHT * abs(np.log(d.area / tr.area))
+        cost = dist + SIZE_WEIGHT * abs(np.log(d.area / tr.area))
+        res = d.idres
+        if res is not None and res[0] is not None and res[0] != tr.id and res[1] >= ID_MIN_PROB:
+            return 1e9  # the ID model is sure this box is another jewel (the one out of sight, now back)
+        if d.sig:  # contested box: how well it fits this jewel against the others
+            mine = d.sig.get(tr.id, 0.0)
+            if max(d.sig.values()) - mine >= SIG_VETO_MARGIN:
+                return 1e9  # another jewel is clearly the one on this box
+            cost += APP_MOVING_PX * (1.0 - mine)
+        return cost
 
     def siglip_input(self, frame, d):
         ox, oy = (int(v) for v in d.origin)
@@ -2667,7 +2761,7 @@ class Worker(QtCore.QThread):
             if self.focus:
                 text += "   |   rubbing: other jewels held in place"
             if self.id_model is not None and not self.id_model.ready:
-                text += "   |   learning the jewels (ResNet18)..."
+                text += "   |   preparing jewel identities..."
             if self.acid_pending_id is not None:
                 text += f"   |   J{self.acid_pending_id}: " + ("acid test running" if self.acid_token else "click Start acid test")
             cv2.putText(vis, text, (10, bottom), FONT, 0.8, DONE_COLOR, 2)
@@ -3219,7 +3313,7 @@ class MainWindow(QtWidgets.QWidget):
                 image = image[max(0,y1-12):y2+12, max(0,x1-12):x2+12]
             self.rub_preview.setPixmap(QtGui.QPixmap.fromImage(to_qimage(image)).scaled(
                 360, 180, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-            self.rub_instruction.setText('New rubbed mask: DETECTED and marked on the video.'
+            self.rub_instruction.setText('New rubbed mark: DETECTED; detection rectangle shown.'
                                          + (' Previous acid overlap: contamination possible.' if payload.get('contamination_possible') else ''))
         elif kind == 'mask_decision':
             self.rub_instruction.setText('New rubbed mask: '+('DETECTED' if payload['detected'] else 'NOT DETECTED')+'. Moving to baseline.'
@@ -3229,9 +3323,7 @@ class MainWindow(QtWidgets.QWidget):
         elif kind == 'acid_detection':
             self.acid_instruction.setText('ACID VERIFIED - acid search stopped; recording 5-second reaction.' if payload['detected'] else
                                           'POSSIBLE ACID - recording now; checking movement and a persistent patch.' if payload.get('provisional') else
-                                          ('PREVIOUS/BASELINE ACID IGNORED - fresh application not confirmed; session remains active.'
-                                           if 'IGNORED' in payload.get('freshness', '') else
-                                           'FRESH ACID APPLICATION NOT CONFIRMED - session remains active.'))
+                                          'WAITING FOR ACID / CLEAR PATCH - freshness is advisory in the PDF.')
         elif kind == 'captured':
             self.acid_instruction.setText('Five-second reaction captured. Processing the result.' if payload.get('capture_complete', True) else
                                           'Session stopped before a complete reaction; saving available evidence.')

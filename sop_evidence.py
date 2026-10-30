@@ -98,6 +98,8 @@ def local_motion(previous, frame, stone, allow_broad=False):
     delta=gray-previous
     delta-=np.median(delta)
     movement=(np.abs(delta)>18).astype(np.uint8)*255
+    # Boundary jitter is weak edge evidence, never jewellery contact.
+    movement[:4]=0;movement[-4:]=0;movement[:,:4]=0;movement[:,-4:]=0
     fraction=np.count_nonzero(movement)/movement.size
     if not .003<fraction<(.98 if allow_broad else .30):return gray,None
     contours,_=cv2.findContours(movement,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
@@ -105,6 +107,7 @@ def local_motion(previous, frame, stone, allow_broad=False):
     c=max(contours,key=cv2.contourArea)
     if cv2.contourArea(c)<12:return gray,None
     x,y,w,h=cv2.boundingRect(c)
+    if max(w,h)/max(1,min(w,h))>8:return gray,None
     box=(x1+round(x*crop.shape[1]/128),y1+round(y*crop.shape[0]/128),
          x1+round((x+w)*crop.shape[1]/128),y1+round((y+h)*crop.shape[0]/128))
     return gray,dict(box=box,score=float(cv2.contourArea(c)))

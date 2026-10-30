@@ -1,7 +1,7 @@
-"""Conservative, stone-relative evidence of a *new* acid application.
+"""Stone-relative acid history and advisory baseline-change measurements.
 
-Boxes are detector footprints, not chemical segmentation. Visual clearing is
-not proof that a surface is chemically clean. Occlusion never clears history.
+Historical overlap and weak baseline change never block detector candidates.
+Current visibility/tool/patch checks live in acid_application.
 """
 import cv2
 import numpy as np
@@ -119,37 +119,30 @@ class FreshAcidGate:
         if not found:
             return None, 'ACID_NOT_DETECTED'
         if not geometry_known or quad is None or self.baseline is None:
-            return self._reject(timestamp, 'FRESH_APPLICATION_NOT_CONFIRMED', found)
+            return self._reject(timestamp, 'STONE_GEOMETRY_UNCERTAIN', found)
         image = normalized(frame, quad)
         changed = changed_pixels(self.baseline, image)
         old = cv2.dilate(self.old_mask, np.ones((9,9), np.uint8)) > 0
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        skin = (hsv[:,:,0] <= 14) & (hsv[:,:,1] >= 110) & (hsv[:,:,2] > 60)
         reasons = []
         for detection in sorted(found, key=lambda d: d['confidence'], reverse=True):
             region = footprint(detection['bbox'], quad) > 0
             area = np.count_nonzero(region)
             if area < 4:
-                reasons.append('FRESH_APPLICATION_NOT_CONFIRMED')
+                reasons.append('INVALID_ACID_REGION')
                 continue
             overlap = np.count_nonzero(region & old)/max(1, min(area, np.count_nonzero(old)))
-            if overlap >= .25:
-                # Same-patch brightness changes, spreading and a tool appearing
-                # cannot establish a fresh chemical application with this model.
-                reasons.append('PREVIOUS_ACID_IGNORED')
-                continue
-            if np.mean(skin[region]) > .3:
-                reasons.append('FRESH_APPLICATION_NOT_CONFIRMED')
-                continue
             fraction = float(np.mean(changed[region]))
             outside = changed[~region]
-            if fraction < .18 or (outside.size and fraction < float(outside.mean())+.10):
-                # A patch already in the baseline must not become a new test.
-                reasons.append('FRESH_APPEARANCE_TOO_WEAK')
-                continue
-            return dict(detection, freshness='NEW_APPEARANCE_OUTSIDE_PREVIOUS_ACID',
-                        fresh_changed_fraction=fraction), 'FRESH_APPLICATION_DETECTED'
-        reason = 'PREVIOUS_ACID_IGNORED' if 'PREVIOUS_ACID_IGNORED' in reasons else reasons[0]
+            weak = fraction < .18 or (outside.size and fraction < float(outside.mean())+.10)
+            # Baseline change/history are audit observations, never blockers.
+            # The independent verifier checks current visibility and persistence.
+            return dict(detection, freshness='FRESHNESS_NOT_REQUIRED',
+                        freshness_warning=True,
+                        weak_change_warning=bool(weak),
+                        previous_acid_overlap=float(overlap),
+                        previous_acid_overlap_warning=bool(overlap>=.25),
+                        fresh_changed_fraction=fraction), 'ACID_DETECTOR_CANDIDATE'
+        reason = reasons[0]
         return self._reject(timestamp, reason, found)
 
     def _reject(self, timestamp, reason, found):

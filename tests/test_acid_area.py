@@ -39,7 +39,7 @@ class AcidAreaTests(unittest.TestCase):
         self.assertLess(box[1],90)
         self.assertGreater(box[3],150)
 
-    def test_export_uses_expanded_area_without_changing_confirmation_box_or_timer(self):
+    def test_export_keeps_classifier_crop_independent_of_expanded_display_area(self):
         from acid_freshness import FreshAcidGate
         from continuous_testing import RubReference
         with monitor_case() as (m,events):
@@ -49,6 +49,8 @@ class AcidAreaTests(unittest.TestCase):
             a['poses']=[(100+i*.1,QUAD.copy()) for i in range(62)]
             a['fresh_gate']=FreshAcidGate(np.zeros((256,256),np.uint8),scene(),QUAD)
             m.classifier=Mock()
+            from test_continuous_testing import Detector
+            m.detector=Detector()
             m.classifier.predict.return_value=dict(prediction='non_gold',confidence=.95)
             for i in range(62):
                 m.journal.offer(scene(acid=i>=10),100+i*.1)
@@ -61,11 +63,17 @@ class AcidAreaTests(unittest.TestCase):
             record=m.tests[0]
             self.assertEqual(101,record['acid_onset'])
             self.assertEqual(list(DETECTION['bbox']),record['detector_bbox'])
-            self.assertGreater(record['reaction_bbox'][2],160)
+            from acid_test.flow import pad_bbox
+            self.assertEqual(list(pad_bbox(record['classification_detector_bbox'],.45,400,300)),record['reaction_bbox'])
             self.assertGreaterEqual(record['acid_area_bbox'][2],154)
             self.assertEqual('COMPARISON_UNAVAILABLE',record['acid_target_status'])
             self.assertEqual('ESTIMATED_PERSISTENT_VISUAL_ACID_AREA',record['acid_area_status'])
             self.assertTrue(Path(record['acid_area_mask']).is_file())
+            self.assertEqual('DISABLED_UNMASKED_SOURCE',record['acid_visual_overlay'])
+            import cv2
+            display=cv2.imread(record['acid_rub_comparison_image'])
+            cyan=(display[:,:,0]>180)&(display[:,:,1]>180)&(display[:,:,2]<80)
+            self.assertFalse(np.any(cyan))
             self.assertGreater(record['acid_placement_timestamp'],record['acid_onset'])
             self.assertEqual('non_gold',record['prediction']['prediction'])
 

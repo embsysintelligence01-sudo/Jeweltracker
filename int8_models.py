@@ -79,8 +79,12 @@ class RubbedMarkDetector:
         self.model = OpenVINOYolo(path, task='detect', imgsz=640)
 
     def regions(self, frame):
+        return self.regions_with_boxes(frame)[0]
+
+    def regions_with_boxes(self, frame):
         result = self.model.predict(frame, conf=.5, iou=.45, max_det=30)[0]
         mask = np.zeros(frame.shape[:2], np.uint8)
+        boxes = []
         h, w = mask.shape
         for box in result.boxes.xyxy.cpu().numpy():
             x1, y1 = np.floor(box[:2]).astype(int)
@@ -89,4 +93,5 @@ class RubbedMarkDetector:
             y1, y2 = np.clip([y1, y2], 0, h)
             if x2 > x1 and y2 > y1:
                 mask[y1:y2, x1:x2] = 255
-        return mask
+                boxes.append((int(x1),int(y1),int(x2),int(y2)))
+        return mask, boxes

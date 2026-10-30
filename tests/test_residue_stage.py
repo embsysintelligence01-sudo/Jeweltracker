@@ -35,7 +35,7 @@ class ResidueStageTests(unittest.TestCase):
         self.assertTrue(np.any(history.mask))
         self.assertEqual('PREVIOUS_ACID_UNCERTAIN',history.snapshot(2.8)['status'])
 
-    def test_next_pickup_continues_with_warning_and_residue_does_not_trigger_timer(self):
+    def test_next_pickup_keeps_warning_and_residue_is_an_advisory_candidate(self):
         with monitor_case() as (m,events):
             h=m.acid_history
             h.observe_idle(scene(),QUAD,[],98,True)
@@ -46,7 +46,9 @@ class ResidueStageTests(unittest.TestCase):
             self.assertEqual('PREVIOUS_ACID_VISIBLE',a['previous_acid_state']['status'])
             self.assertIn('contamination possible',a['residue_warning'])
             gate=FreshAcidGate(h.mask,scene(acid=True),QUAD)
-            self.assertIsNone(gate.check(scene(acid=True),QUAD,[DETECTION],101)[0])
+            candidate=gate.check(scene(acid=True),QUAD,[DETECTION],101)[0]
+            self.assertTrue(candidate['freshness_warning'])
+            self.assertTrue(candidate['previous_acid_overlap_warning'])
             self.assertIsNone(a['acid_onset'])
 
     def test_after_pickup_rubbing_or_baseline_cannot_clear_or_pollute_residue_history(self):
@@ -63,7 +65,8 @@ class ResidueStageTests(unittest.TestCase):
             mark=dict(DETECTION,bbox=(180,105,195,140))
             m._acid_observation(101.2,a['id'],[mark],(scene(mark=True),QUAD,True,True,True))
             np.testing.assert_array_equal(old,m.acid_history.mask)
-            self.assertTrue(np.any(a['fresh_gate'].old_mask & footprint(mark['bbox'],QUAD)))
+            np.testing.assert_array_equal(old,a['fresh_gate'].old_mask)
+            self.assertEqual([mark],a['baseline_acid_detections'])
 
     def test_late_clear_frame_before_pickup_updates_frozen_warning(self):
         with monitor_case() as (m,events):
@@ -84,7 +87,7 @@ class ResidueStageTests(unittest.TestCase):
         self.assertFalse(np.any(vis[210:251,310:351]))
         initial['area_status']='ESTIMATED_PERSISTENT_FOOTPRINT'
         vis=draw_workflow(base.copy(),state,acid=initial)
-        self.assertTrue(np.any(vis[210:251,310:351]))
+        self.assertFalse(np.any(vis[210:251,310:351]))
 
     def test_unavailable_area_report_has_no_small_cyan_fallback(self):
         with monitor_case() as (m,events):

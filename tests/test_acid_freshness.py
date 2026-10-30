@@ -30,7 +30,7 @@ class FreshnessTests(unittest.TestCase):
     def test_faint_new_application_is_not_permanently_learned_as_old_acid(self):
         gate=FreshAcidGate(np.zeros((256,256),np.uint8),scene(),QUAD)
         faint=scene();faint[107:110,128:133]=(0,255,0)
-        self.assertIsNone(gate.check(faint,QUAD,[OLD],1)[0])
+        self.assertTrue(gate.check(faint,QUAD,[OLD],1)[0]['freshness_warning'])
         self.assertFalse(np.any(gate.old_mask))
         self.assertIsNotNone(gate.check(scene(acid=True),QUAD,[OLD],1.2)[0])
     def test_previous_patch_survives_stone_translation_and_new_patch_can_trigger_once(self):
@@ -41,22 +41,26 @@ class FreshnessTests(unittest.TestCase):
         shifted = cv2.warpAffine(scene(acid=True), np.float32([[1,0,30],[0,1,20]]), (400,300))
         moved_old = dict(OLD,bbox=(158,127,173,159))
         best, reason = gate.check(shifted, shifted_quad, [moved_old], 10)
-        self.assertIsNone(best)
-        self.assertEqual('PREVIOUS_ACID_IGNORED',reason)
-        # Even obvious changes inside the old footprint do not prove a new dose.
+        self.assertIsNotNone(best)
+        self.assertTrue(best['freshness_warning'])
+        self.assertTrue(best['previous_acid_overlap_warning'])
+        # A changed patch is a candidate even in historical locations;
+        # clear-frame/tool checks still decide whether it is an application.
         changed = scene(acid=True)
         changed[107:139,128:143] = (255,255,255)
-        self.assertIsNone(gate.check(changed,QUAD,[OLD],11)[0])
+        candidate=gate.check(changed,QUAD,[OLD],11)[0]
+        self.assertIsNotNone(candidate)
+        self.assertTrue(candidate['previous_acid_overlap_warning'])
         best, _ = gate.check(two_patches(), QUAD, [OLD, NEW], 12)
-        self.assertEqual(NEW['bbox'],best['bbox'])
+        self.assertEqual(OLD['bbox'],best['bbox'])  # history no longer ranks away old locations
 
-    def test_baseline_acid_global_light_and_unknown_geometry_do_not_trigger(self):
+    def test_baseline_and_light_are_advisory_but_geometry_is_required(self):
         empty = np.zeros((256,256),np.uint8)
         gate = FreshAcidGate(empty,scene(acid=True),QUAD)
-        self.assertIsNone(gate.check(scene(acid=True),QUAD,[OLD],1)[0])
+        self.assertTrue(gate.check(scene(acid=True),QUAD,[OLD],1)[0]['freshness_warning'])
         gate = FreshAcidGate(empty,scene(),QUAD)
         brighter = np.clip(scene().astype(int)+35,0,255).astype(np.uint8)
-        self.assertIsNone(gate.check(brighter,QUAD,[OLD],2)[0])
+        self.assertTrue(gate.check(brighter,QUAD,[OLD],2)[0]['freshness_warning'])
         gate = FreshAcidGate(empty,scene(),QUAD)
         self.assertIsNone(gate.check(scene(acid=True),QUAD,[OLD],3,False)[0])
         self.assertIsNotNone(gate.check(scene(acid=True),QUAD,[OLD],4,True)[0])
@@ -74,45 +78,24 @@ class FreshnessTests(unittest.TestCase):
         self.assertFalse(np.any(history.mask))
         self.assertEqual('VISUALLY_CLEARED',history.events[-1]['status'])
 
-    def test_live_clip_and_final_export_all_reject_old_acid(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            monitor = ContinuousMonitor(tmp,lambda:None,Photos(),Mock(),lambda *a,**k:None)
-            monitor.detector=Detector()
-            monitor.classifier=Mock()
-            try:
-                monitor.acid_history.remember([OLD],QUAD)
-                for i in range(100):
-                    ts=100+i*.1
-                    held=10<=i<20
-                    image=scene(acid=True)
-                    monitor.journal.offer(image,ts)
-                    monitor.step(dict(frame=image,timestamp=ts,mode='LOCKED',revision=0,
-                        stone=STONE,placement=None,bench_moving=held,rubbing=False,
-                        tracks=[track(state='OCCLUDED' if held else 'OK',spot='hand' if held else 'jewel',seen=ts,in_hand=held)]))
-                    time.sleep(.003)
-                a=monitor.active
-                self.assertIsNotNone(a)
-                self.assertIsNone(a['acid_onset'])
-                monitor.journal.queue.join()
-                recovery=dict(a,fresh_gate=a['fresh_gate'].fork(),stop_search=threading.Event())
-                self.assertIsNone(monitor._search_recording(recovery,a['returned'],monitor.last_ts)[1])
-                monitor._finish(monitor.last_ts,'Explicit session stop for verification.')
-                monitor.pool.shutdown(wait=True)
-                monitor.detector_pool.shutdown(wait=True)
-                monitor.finish_pool.shutdown(wait=True)
-                monitor.report_pool.shutdown(wait=True)
-                record=monitor.tests[0]
-                self.assertFalse(record['capture_complete'])
-                self.assertIsNone(record['acid_onset'])
-                self.assertIsNone(record['prediction'])
-                self.assertTrue(record['fresh_acid_rejections'])
-                monitor.classifier.predict.assert_not_called()
-            finally:
-                monitor.pool.shutdown(wait=True,cancel_futures=True)
-                monitor.detector_pool.shutdown(wait=True,cancel_futures=True)
-                monitor.finish_pool.shutdown(wait=True)
-                monitor.report_pool.shutdown(wait=True)
-                monitor.journal.close()
+    def test_live_and_export_allow_baseline_acid_with_warning(self):
+        from test_sop_revision import monitor_case,snap
+        with monitor_case() as (monitor,events):
+            monitor.step(snap(100,held=1));a=monitor.active
+            monitor.detector=Detector();monitor.classifier=None
+            a.update(returned=100.1,baseline_at=100.2,return_frame=scene(acid=True),
+                     fresh_gate=FreshAcidGate(footprint(OLD['bbox'],QUAD),scene(acid=True),QUAD),
+                     poses=[(100+i*.1,QUAD.copy()) for i in range(70)])
+            for i in range(70):monitor.journal.offer(scene(acid=True),100+i*.1)
+            monitor.journal.queue.join()
+            monitor._acid_observation(100.5,a['id'],[OLD],(scene(acid=True),QUAD,True,True,False))
+            monitor._verify_application(a,scene(acid=True),QUAD,100.55,True,True)
+            self.assertIsNotNone(a['acid_onset'])
+            monitor._finish(105.6);monitor.drain_finalization()
+            record=monitor.tests[0]
+            self.assertTrue(record['capture_complete'])
+            self.assertTrue(record['fresh_acid_evidence']['freshness_warning'])
+            self.assertTrue(any('Freshness checking is advisory' in s for s in record['issues']))
 
     def test_new_acid_elsewhere_keeps_model_output_and_saves_both_locations(self):
         with tempfile.TemporaryDirectory() as tmp:
