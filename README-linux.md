@@ -56,17 +56,17 @@ covered jewel uses the existing under-hand/bench-motion evidence. Absence alone
 does not establish an in-hand identity. Ambiguous or completely missed IDs stay
 explicit in the evidence record.
 
-Trial pickup policy: **UNDER_HAND alone does not start a jewel's recording/test
-cycle**, and does not seed its recent pickup history. IN_HAND evidence can start
-the cycle; a cycle already in progress continues through later hand coverage.
-The full session recording and under-hand visibility notes remain available.
-`PICKUP_STATES` in `continuous_testing.py` currently contains only `IN_HAND`.
+Pickup policy: **UNDER_HAND alone does not start a jewel's recording/test
+cycle**, and does not seed its recent pickup history. Actual IN_HAND evidence
+can open pickup tracking; a cycle already in progress continues through later
+hand coverage. Tracker-box departure does not open a provisional test window.
+The full session journal and under-hand visibility notes remain available.
 
 Gold-on-stone contact acceptance is scoped to that recording cycle. With jewels
 resting on the bed, the loaded jewellery model continues ID tracking, but its
 stone polygons are not interpreted as rubbing contact. A pickup begins a fresh
-contact/movement history. Contacts from another cycle or an inference started
-before the gate opened are rejected. A jewel appearing back on the bed immediately
+contact/movement history. Two distinct fresh jewellery-mask overlaps inside the stone are required to arm rubbing evidence; stone-border-only strips are excluded. Contacts from another cycle or an inference started
+before the gate opened are rejected. A return alone cannot bypass the overlap requirement or start baseline. A jewel appearing back on the bed immediately
 suppresses new contact updates; two distinct fresh return observations spanning
 at least 120 ms confirm the return and close the gate. Confirmed new masks,
 baseline start (including a failed-mask decision), acid capture, cycle completion
