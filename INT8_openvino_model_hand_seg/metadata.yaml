@@ -1,0 +1,24 @@
+description: Ultralytics YOLO26s-seg model trained on /content/datasets/hand-seg-1/data.yaml
+author: Ultralytics
+date: '2026-10-30T12:47:58.266700+05:30'
+version: 8.4.189
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: segment
+head: Segment26
+batch: 1
+imgsz:
+- 320
+- 320
+names:
+  0: handseg - vdataset handseg-9w6ds
+args:
+  data: C:\Users\embsy\Downloads\hand-seg.v1i.yolov8\data.yaml
+  batch: 1
+  fraction: 1.0
+  quantize: 8
+  nms: null
+  dynamic: false
+channels: 3
+end2end: false

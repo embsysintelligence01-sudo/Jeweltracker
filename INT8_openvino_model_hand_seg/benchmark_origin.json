@@ -1,0 +1,8 @@
+{
+  "image_size": 320,
+  "precision": 8,
+  "source_pt_sha256": "3e6b1ef597d144cadf7ef177c96d1ba8eb34dde065b153962772b09571dd9dda",
+  "calibration_yaml_sha256": "723abffa2c790c9c687a7f9c37bf2b552e34436fccc6c399fa559675a1407686",
+  "calibration_split": "train",
+  "calibration_fraction": 1.0
+}

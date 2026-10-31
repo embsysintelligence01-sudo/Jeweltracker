@@ -16,8 +16,7 @@
     "user": "admin",
     "password": "admin123",
     "channel": 1,
-    "subtype": 0,
-    "antiflicker": "50 Hz"
+    "subtype": 0
   },
   "direct": {
     "ip": "192.168.29.215",
