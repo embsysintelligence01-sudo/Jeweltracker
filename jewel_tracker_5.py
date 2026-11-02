@@ -81,6 +81,7 @@ from jewel_identity import IdentityMatcher
 from rub_preparation import RubPhotoModels, RubCycle, StoneCleanup, draw_acid_roi, render_rub_preview
 from auto_testing import StoneSettling
 from continuous_testing import ContinuousMonitor, draw_workflow, PHASE_TITLES
+from pickup_evidence import HomeAnchor, coverage as home_coverage
 from session_evidence import prediction_text
 from linux_camera_controls import LINUX_AF_DEFAULT, apply_linux_antiflicker
 
@@ -270,7 +271,7 @@ SIGLIP_MODEL = os.path.join(SCRIPT_DIR, "weights", SIGLIP_FILE)
 if not os.path.exists(SIGLIP_MODEL):
     SIGLIP_MODEL = os.path.join(SIGLIP_BACKEND_DIR, "weights", SIGLIP_FILE)
 
-COLORS = {"OK": (0, 200, 0), "OCCLUDED": (0, 200, 255), "RUBBING": (0, 140, 255),
+COLORS = {"OCCLUDED_HOME": (0, 200, 255), "OK": (0, 200, 0), "OCCLUDED": (0, 200, 255), "RUBBING": (0, 140, 255),
           "LEFT_ROI": (0, 0, 255), "MISSING": (0, 0, 255)}
 DONE_COLOR = (255, 255, 0)       # rubbed and placed back
 RUBBED_COLOR = (255, 0, 255)     # rubbed, not placed back yet
@@ -796,6 +797,10 @@ class Track:
         self.acid_box = None
         self.acid_result = None
         self.acid_crop = None
+        self.home_anchor = None
+        self.original_home_box = np.asarray(det.box, float).copy()
+        self.last_reliable_box = self.original_home_box.copy()
+        self.last_reliable_at = t
         self.app = det.app        # appearance fingerprint taken at lock (never updated)
         self.det_seen = t         # last time the detector itself found it
         self.det_box = det.box    # its box at that moment
@@ -1545,33 +1550,8 @@ class Worker(QtCore.QThread):
                 self.rubber.suspend(ts)
                 self.rub_ev, self.rubbing_now = None, False
                 return
-            # Arm evidence only from two distinct, current gold/stone overlaps.
-            # Pickup tracking and the rolling recorder remain independent.
-            if getattr(self,'continuous_overlap_trigger',None) is None:
-                ev=(rubbing_evidence(*self.gold_observation,frame.shape,captured_stone)
-                    if captured_stone is not None and revision==self.flow_revision
-                    and 0<=time.time()-ts<=LIVE_RESULT_MAX_AGE_S
-                    and stone_observation_matches(captured_stone,self.stone_box()) else None)
-                if ev is not None:
-                    sx1,sy1,sx2,sy2=map(int,captured_stone)
-                    margin=max(3,int(.03*min(sx2-sx1,sy2-sy1)))
-                    ox,oy=ev['origin'];mask=ev['mask']
-                    x1,y1=max(0,sx1+margin-ox),max(0,sy1+margin-oy)
-                    x2,y2=min(mask.shape[1],sx2-margin-ox),min(mask.shape[0],sy2-margin-oy)
-                    if x2<=x1 or y2<=y1 or np.count_nonzero(mask[y1:y2,x1:x2])<RUB_MIN_MASK_PX:
-                        ev=None
-                previous=getattr(self,'continuous_overlap_probe',None)
-                if ev is None:
-                    self.continuous_overlap_probe=None
-                elif previous is not None and 0<ts-previous['last']<=.5:
-                    self.continuous_overlap_trigger=dict(timestamp=previous['start'],confirmed_at=ts,
-                        cycle_token=contact_token,box=tuple(ev['box']),frames=2)
-                elif previous is None or ts>previous['last']:
-                    self.continuous_overlap_probe=dict(start=ts,last=ts)
-                if getattr(self,'continuous_overlap_trigger',None) is None:
-                    self.rubber.suspend(ts)
-                    self.rub_ev,self.rubbing_now=None,False
-                    return
+            # The provisional/departure evidence window owns recording. A
+            # current overlap supports contact, never gates its observation.
             self.rubber.active = True
         else:
             self.rubber.active = (self.mode == "LOCKED" and self.acid_pending_id is None
@@ -1592,7 +1572,7 @@ class Worker(QtCore.QThread):
         with self.lock:
             return dict(frame=frame, timestamp=ts, mode=self.mode, revision=self.flow_revision,
                 stone=self.stone_box(), placement=self.test_roi,
-                overlap_trigger_required=True,
+                home_tracking=True, overlap_trigger_required=False,
                 rubbing_trigger=getattr(self,'continuous_overlap_trigger',None),
                 contact=(dict(self.rub_ev, confirmed=bool(self.rubbing_now),
                               area=int(np.count_nonzero(self.rub_ev['mask'])))
@@ -1600,6 +1580,8 @@ class Worker(QtCore.QThread):
                 rubbing=bool(self.rubbing_now and self.rubber is not None and 0 <= ts-self.rubber.ts < RUB_GAP_S), bench_moving=bool(getattr(self, 'moving_now', False)),
                 tracks=[dict(id=tr.id, state=tr.state, spot=tr.spot, det_seen=tr.det_seen,
                     pos=tr.pos.copy(), box=np.asarray(tr.det_box).copy(), in_hand=getattr(tr, 'in_hand', False),
+                    pickup=(tr.home_anchor.snapshot() if getattr(tr,'home_anchor',None) is not None else None),
+                    in_bed=self.roi_dist(tr.pos)>=0 and not self.on_stone(tr.pos,margin=0),
                     thumb=getattr(tr, 'thumb', None),
                     acid_done=tr.acid_done or getattr(tr, 'test_captured', False)) for tr in self.tracks])
 
@@ -1852,6 +1834,8 @@ class Worker(QtCore.QThread):
         if frame is not None and self.id_model is not None:
             self.learn_ids(frame)
         for tr, (d, item, _, _) in zip(self.tracks, jewels):
+            if self.continuous_enabled and frame is not None:
+                tr.home_anchor=HomeAnchor(d.box,t,frame)
             # the jewel as captured, shown in the status table
             tr.thumb = (item or {}).get("thumb")
             if tr.thumb is None and frame is not None:
@@ -2044,14 +2028,36 @@ class Worker(QtCore.QThread):
         self.cur_frame = frame
         if frame is not None:
             self.update_motion(frame, t)
+        if self.continuous_enabled and frame is not None:
+            for tr in self.tracks:
+                if getattr(tr,'home_anchor',None) is None:
+                    tr.home_anchor=HomeAnchor(tr.original_home_box,tr.last_seen,frame)
+                tr.home_anchor.probe(frame,t)
         self.mark_stable(dets, t)
-        free = list(range(len(dets)))
+        if self.continuous_enabled and frame is not None:
+            for tr in self.tracks:
+                a=tr.home_anchor
+                if not a.enabled or a.started is None or a.departed_at is not None or a.presence!='COVERED':continue
+                clear_home=[det for det in dets if a.near_home(det.box) and a.complete_box(det.box)
+                    and a.clear_around(frame,det.box) and a.looks_like(frame,det.box)
+                    and self._home_identity_supported(tr,det,frame)]
+                if len(clear_home)==1:a.cancel_at_home(clear_home[0].box,t,frame)
+                else:a.home_clear_probe=None
+        blocked=set()
+        if self.continuous_enabled:
+            for j,det in enumerate(dets):
+                if any(getattr(tr,'home_anchor',None) is not None and tr.home_anchor.enabled
+                       and tr.home_anchor.presence=='COVERED' and home_coverage(det.box,tr.home_anchor.home_box)>.5
+                       and (tr.home_anchor.departed_at is None or not tr.home_anchor.complete_box(det.box)
+                            or not tr.home_anchor.clear_around(frame,det.box) or not tr.home_anchor.looks_like(frame,det.box))
+                       for tr in self.tracks):blocked.add(j)
+        free = [j for j in range(len(dets)) if j not in blocked]
         match = {}  # track index -> detection index
         ready = self.id_model is not None and self.id_model.ready and frame is not None
         # 1: jewels seen a moment ago -> by position (Hungarian on distance + size)
         active = [i for i, tr in enumerate(self.tracks) if t - tr.det_seen < TRACK_KEEP_S]
         if ready and isinstance(self.id_model, IdentityMatcher):
-            self.score_contested(dets, active, frame, t)
+            self.score_contested([dets[j] for j in free], active, frame, t)
         for i, j in self.assign(active, free, dets, t, self.motion_cost):
             match[i] = j
             free.remove(j)
@@ -2126,6 +2132,21 @@ class Worker(QtCore.QThread):
         # 4: IDs swapped? a followed jewel that stands still is checked once by the ID model
         if ready:
             self.check_swaps(match, dets, frame, t)
+        if self.continuous_enabled and frame is not None:
+            # A unique departed jewel can return anywhere on the bed before
+            # the existing gallery has warmed up. Require full-size appearance
+            # and visibly present other jewels; never use this on the stone.
+            unresolved=[(i,tr) for i,tr in enumerate(self.tracks) if i not in match
+                and getattr(tr,'home_anchor',None) is not None and tr.home_anchor.enabled
+                and tr.home_anchor.departed_at is not None and tr.home_anchor.returned_at is None]
+            if len(unresolved)==1:
+                i,tr=unresolved[0]
+                options=[j for j in free if self.roi_dist(dets[j].c)>=0 and not self.on_stone(dets[j].c,margin=0)
+                    and self._home_match_allowed(tr,dets[j],frame) and self._home_identity_supported(tr,dets[j],frame)]
+                if len(options)==1:match[i]=options[0];free.remove(options[0])
+            for i,j in list(match.items()):
+                if not self._home_match_allowed(self.tracks[i],dets[j],frame):
+                    del match[i]
         # apply, with the movement score (how much the centre jitters: the rubbed jewel moves most)
         seen = set(match)
         for i, tr in enumerate(self.tracks):
@@ -2134,6 +2155,14 @@ class Worker(QtCore.QThread):
                 step = float(np.hypot(*(d.c - tr.pos))) if t - tr.last_seen < 0.5 else 0.0
                 tr.move = (1 - MOVE_EMA) * tr.move + MOVE_EMA * step
                 tr.correct(d, t)
+                if self.continuous_enabled and frame is not None and tr.home_anchor is not None:
+                    anchor=tr.home_anchor
+                    tr.home_hand_contact=self.hand_contact(tr,frame)
+                    identity=self._home_identity_supported(tr,d,frame)
+                    anchor.reliable(d.box,t,frame,
+                        self.roi_dist(d.c)>=0 and not self.on_stone(d.c,margin=0)
+                        and not tr.home_hand_contact,identity)
+                    tr.last_reliable_box=anchor.last_box.copy();tr.last_reliable_at=anchor.last_seen
             else:
                 tr.move *= 1 - MOVE_EMA
         for i, tr in enumerate(self.tracks):
@@ -2146,7 +2175,10 @@ class Worker(QtCore.QThread):
                 tr.removed_since = (tr.removed_since or t) if tr.spot == "removed" else None
         if self.continuous_enabled and frame is not None:
             for i, tr in enumerate(self.tracks):
-                tr.in_hand = i in seen and self.hand_contact(tr, frame)
+                anchor=getattr(tr,'home_anchor',None)
+                covered=anchor is not None and anchor.enabled and anchor.presence=='COVERED'
+                tr.in_hand = i in seen and not covered and getattr(tr,'home_hand_contact',False)
+                if covered and anchor.departed_at is None:tr.spot='hand'
         self.update_rubbing(t)
         self.update_acid(t)
         for i, tr in enumerate(self.tracks):
@@ -2155,6 +2187,40 @@ class Worker(QtCore.QThread):
                     or (tr.spot == 'removed' and getattr(self, 'moving_now', False))):
                 tr.hand_last = t
             self.check_done(tr, i in seen, t)
+
+    def _home_identity_supported(self,tr,det,frame):
+        result=getattr(det,'idres',None)
+        if result is not None and result[0] is not None and result[1]>=ID_MIN_PROB:
+            return result[0]==tr.id
+        signature=getattr(det,'sig',None)
+        if signature:
+            ranked=sorted(signature.items(),key=lambda item:item[1],reverse=True)
+            if ranked[0][0]==tr.id and ranked[0][1]>=.75 and (len(ranked)==1 or ranked[0][1]-ranked[1][1]>=SIG_VETO_MARGIN):
+                return True
+        anchor=getattr(tr,'home_anchor',None)
+        if anchor is None or not anchor.enabled:return False
+        if anchor.presence=='PRESENT' and anchor.near_home(det.box):return True
+        # Closed-world fallback only when every other jewel is visibly at home.
+        others=[getattr(other,'home_anchor',None) for other in self.tracks if other.id!=tr.id]
+        unique=all(a is not None and a.enabled and a.presence=='PRESENT' for a in others)
+        return (unique and not self.on_stone(det.c,margin=0) and anchor.complete_box(det.box)
+                and anchor.looks_like(frame,det.box))
+
+    def _home_match_allowed(self,tr,det,frame):
+        anchor=getattr(tr,'home_anchor',None)
+        if anchor is None or not anchor.enabled:return True
+        for other in self.tracks:
+            a=getattr(other,'home_anchor',None)
+            if other.id!=tr.id and a is not None and a.enabled and a.presence=='PRESENT' and home_coverage(det.box,a.home_box)>.5:
+                return False  # a covered J1 cannot take the still-visible J2 box
+        if not anchor.complete_box(det.box):return False
+        if anchor.presence=='COVERED' and anchor.near_home(det.box):
+            return (anchor.departed_at is not None and anchor.clear_around(frame,det.box)
+                    and anchor.looks_like(frame,det.box) and self._home_identity_supported(tr,det,frame))
+        if anchor.presence=='PRESENT' and anchor.departed_at is None and not anchor.near_home(det.box):return False
+        if anchor.started is not None and not anchor.near_home(det.box):
+            return self._home_identity_supported(tr,det,frame)
+        return True
 
     @staticmethod
     def hand_contact(tr, frame):
@@ -2174,7 +2240,8 @@ class Worker(QtCore.QThread):
         if ix2 <= ix1 or iy2 <= iy1:
             return False
         local[iy1-y1:iy2-y1, ix1-x1:ix2-x1] = (mask[iy1-oy:iy2-oy, ix1-ox:ix2-ox] > 0).astype(np.uint8)
-        contact = cv2.dilate(local, np.ones((17,17), np.uint8)) > 0
+        # Measure skin around the gold mask, not the jewel's own golden pixels.
+        contact = (cv2.dilate(local, np.ones((17,17), np.uint8)) > 0) & (local == 0)
         hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
         skin = (hsv[:,:,0] <= SKIN_H_MAX) & (hsv[:,:,1] >= SKIN_S_MIN) & (hsv[:,:,2] > 60)
         return np.count_nonzero(skin & contact) >= max(60, .12*np.count_nonzero(contact))
@@ -2623,6 +2690,10 @@ class Worker(QtCore.QThread):
 
     def evaluate(self, tr, seen, t):
         old = tr.state
+        anchor=getattr(tr,'home_anchor',None)
+        if self.continuous_enabled and anchor is not None and anchor.enabled and anchor.state=='OCCLUDED_HOME':
+            tr.state='OCCLUDED_HOME'
+            return
         d = self.roi_dist(tr.pos)
         if seen:
             if d < 0:
@@ -2711,7 +2782,7 @@ class Worker(QtCore.QThread):
             label = name if tr.state == "OK" else f"{name} {tr.state}"
             if self.continuous_enabled and getattr(tr, "in_hand", False):
                 label = f"{name} in hand"
-            if tr.state in ("OK", "OCCLUDED", "RUBBING"):
+            if tr.state in ("OK", "OCCLUDED", "OCCLUDED_HOME", "RUBBING"):
                 if tr.done:
                     col, label = DONE_COLOR, f"{name} DONE"
                 elif tr.rubbed and tr.acid_done:

@@ -15,8 +15,11 @@ class ConfirmedAcidCropTests(unittest.TestCase):
         a.update(returned=100.1,baseline_at=100.2,return_frame=scene(),
                  fresh_gate=FreshAcidGate(np.zeros((256,256),np.uint8),scene(),QUAD),
                  poses=[(100+i*.1,QUAD.copy()) for i in range(71)])
-        for i in range(71):m.journal.offer(scene(acid=i>=10),100+i*.1)
-        m.journal.queue.join()
+        # Feed a complete synthetic capture deterministically: a burst of 71
+        # frames must not exercise the separate nonblocking queue-overload path.
+        for i in range(71):
+            m.journal.offer(scene(acid=i>=10),100+i*.1)
+            m.journal.queue.join()
         best=dict(DETECTION,source_frame=scene(acid=True),quad=QUAD.copy())
         if confirmed:best['application_verification']='DETECTOR_AND_VISIBLE_PERSISTENT_PATCH'
         m._set_acid(a,101,best)

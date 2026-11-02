@@ -20,11 +20,17 @@ class RetentionPolicy:
     require_server_ack: bool=True
     ack_hmac_environment: str='JEWELTRACKER_ACK_HMAC_KEY'
     archive_retention_days: int=90
+    target_test_bytes: int=2_000_000
+    archive_min_long_edge: int=1280
+    archive_min_ssim: float=.95
+    retain_frame_catalogue: bool=False
+    bank_min_retention_days: int=0
+    original_min_retention_days: int=0
 
     def __post_init__(self):
-        for name in ('enabled','cleanup_raw_after_archive','require_server_ack'):
+        for name in ('enabled','cleanup_raw_after_archive','require_server_ack','retain_frame_catalogue'):
             if type(getattr(self,name)) is not bool:raise ValueError('Retention flags must be JSON booleans')
-        for name in ('idle_buffer_seconds','pre_roll_seconds','disk_warning_free_gib','h264_crf','encoder_threads','archive_retention_days'):
+        for name in ('idle_buffer_seconds','pre_roll_seconds','disk_warning_free_gib','h264_crf','encoder_threads','archive_retention_days','target_test_bytes','archive_min_long_edge','archive_min_ssim','bank_min_retention_days','original_min_retention_days'):
             value=getattr(self,name)
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):raise ValueError('Retention numbers must be finite')
         if self.disk_warning_free_gib<0 or self.archive_codec not in ('h264','mjpeg'):raise ValueError('Invalid storage alert/codec policy')
@@ -32,6 +38,10 @@ class RetentionPolicy:
             raise ValueError('Idle buffer must cover at least four seconds of pre-roll')
         if not 0<=self.h264_crf<=28 or not 1<=self.encoder_threads<=2:
             raise ValueError('Invalid archive quality/thread settings')
+        if self.target_test_bytes<100_000 or self.archive_min_long_edge<960 or not .9<=self.archive_min_ssim<=1:
+            raise ValueError('Invalid evidence size/quality floor')
+        if self.bank_min_retention_days<0 or self.original_min_retention_days<0 or self.archive_retention_days<max(self.bank_min_retention_days,self.original_min_retention_days):
+            raise ValueError('Archive retention violates bank minimum')
         if self.archive_retention_days<1:raise ValueError('Retention must be at least one day')
 
     @classmethod
@@ -85,7 +95,12 @@ def report_guard(directory):
 
 
 def tree_bytes(path):
-    return sum(p.stat().st_size for p in Path(path).rglob('*') if p.is_file() and not p.is_symlink())
+    total=0
+    for p in Path(path).rglob('*'):
+        try:
+            if p.is_file() and not p.is_symlink():total+=p.stat().st_size
+        except FileNotFoundError:continue  # Active recorder may prune idle frames during inspection.
+    return total
 
 
 def checked_local(root,path):
@@ -98,6 +113,22 @@ def checked_local(root,path):
     if any(q.is_symlink() for q in [p,*p.parents] if q!=root.parent):
         raise ValueError('Symlink parent in evidence path')
     return resolved
+
+
+def validate_pdf(path):
+    content=Path(path).read_bytes()
+    if not content.startswith(b'%PDF') or not content.rstrip().endswith(b'%%EOF') or b'startxref' not in content:
+        raise OSError('Incomplete/corrupt final PDF')
+    exe=shutil.which('pdfinfo')
+    if exe:
+        result=subprocess.run([exe,str(path)],capture_output=True,text=True,timeout=15)
+        if result.returncode or not any(line.startswith('Pages:') and int(line.split(':',1)[1])>0 for line in result.stdout.splitlines()):
+            raise OSError('Final PDF failed parser verification')
+    else:
+        try:
+            offset=int(content.rsplit(b'startxref',1)[1].split()[0])
+            if not content[offset:].startswith(b'xref'):raise ValueError('Unsupported/corrupt cross-reference table')
+        except (ValueError,IndexError) as exc:raise OSError('PDF cross-reference verification failed') from exc
 
 
 def validate_video(path,metadata):
@@ -116,9 +147,14 @@ def validate_video(path,metadata):
             if frame is None or not frame.size:raise OSError('Empty video frame')
             if shape is not None and frame.shape!=shape:raise OSError('Video frame resolution changed')
             shape=frame.shape;count+=1
-        if count<1 or count!=metadata.get('frames'):raise OSError('Decoded video frame count does not match evidence metadata')
+        archive_media=metadata.get('archive_media')
+        expected_count=archive_media['frames'] if archive_media else metadata.get('frames')
+        if count<1 or count!=expected_count:raise OSError('Decoded video frame count does not match evidence metadata')
         timestamps=metadata.get('timestamps',[])
-        if len(timestamps)!=count or any(b<=a for a,b in zip(timestamps,timestamps[1:])):
+        numbers=[*timestamps,metadata['playback_seconds'],metadata['actual_start'],metadata['actual_end'],metadata['requested_start'],metadata['requested_end']]
+        if any(not isinstance(v,(float,int)) or isinstance(v,bool) or not math.isfinite(v) for v in numbers):
+            raise OSError('Non-finite/invalid video timestamp metadata')
+        if len(timestamps)!=metadata.get('frames') or any(b<=a for a,b in zip(timestamps,timestamps[1:])):
             raise OSError('Invalid video timestamp sidecar')
         duration=count/fps;expected=float(metadata['playback_seconds'])
         if abs(duration-expected)>max(.25,2/fps):raise OSError('Video duration does not match evidence metadata')
@@ -133,13 +169,19 @@ def validate_video(path,metadata):
 
 
 def encoder_available():
-    exe=shutil.which('ffmpeg')
+    exe=os.environ.get('JEWELTRACKER_FFMPEG') or shutil.which('ffmpeg')
+    if not exe:
+        local=Path.home()/'.local/share/jeweltracker/ffmpeg/ffmpeg'
+        exe=str(local) if local.is_file() else None
     if not exe:return None
     result=subprocess.run([exe,'-hide_banner','-encoders'],capture_output=True,text=True,timeout=10)
     return exe if result.returncode==0 and 'libx264' in result.stdout else None
 
 
-def archive_video(source,output,policy,ffmpeg):
+def archive_video(source,output,policy,ffmpeg,budget_bytes=None,source_metadata=None):
+    if ffmpeg and policy.archive_codec=='h264' and budget_bytes is not None:
+        from compact_evidence import encode_compact
+        return encode_compact(source,output,source_metadata,policy,ffmpeg,budget_bytes)
     if ffmpeg and policy.archive_codec=='h264':
         output=output.with_suffix('.mp4')
         command=[ffmpeg,'-nostdin','-v','error','-y','-i',str(source),'-an','-c:v','libx264',
@@ -152,6 +194,7 @@ def archive_video(source,output,policy,ffmpeg):
         return output,'h264'
     output=output.with_suffix(source.suffix.lower())
     shutil.copyfile(source,output)
+    if digest(source)!=digest(output):raise OSError('Fallback video copy checksum mismatch')
     return output,'original_mjpeg_fallback'
 
 
@@ -200,16 +243,14 @@ class ArchiveManager:
     def _state(self,stage,**kw):
         durable_json(self.root/'archive_state.json',dict(stage=stage,updated_at=time.time(),**kw))
 
-    def finalize(self,quiescent=False,session_guard=None):
+    def finalize(self,quiescent=False,session_guard=None,force_repack=False):
         if not quiescent:raise RuntimeError('Archive requires all writer/recovery/report jobs to be drained')
         if session_guard is None:
-            with SessionGuard(self.root) as guard:return self.finalize(True,guard)
+            with SessionGuard(self.root) as guard:return self.finalize(True,guard,force_repack)
         if session_guard.handle.closed or session_guard.directory!=self.root:
             raise RuntimeError('Invalid session ownership guard')
         with report_guard(self.root):
             try:
-                if (self.root/'archive_commit.json').is_file():
-                    commit=self.validate_commit();return self._cleanup(commit)
                 state_path=self.root/'archive_state.json'
                 state=json.loads(state_path.read_text()) if state_path.is_file() else {}
                 resume=state if state.get('stage')=='PUBLISHING' else state.get('resume',{})
@@ -219,6 +260,9 @@ class ArchiveManager:
                     self._publish(final,data)
                     durable_json(self.root/'archive_commit.json',commit)
                     return self._cleanup(commit)
+                if (self.root/'archive_commit.json').is_file():
+                    commit=self.validate_commit()
+                    return self._build(previous_commit=commit) if force_repack else self._cleanup(commit)
                 return self._build()
             except Exception as exc:
                 state_path=self.root/'archive_state.json'
@@ -227,12 +271,22 @@ class ArchiveManager:
                 self._state('FAILED_RAW_RETAINED',error=str(exc),resume=resume)
                 raise
 
-    def _build(self):
+    def _build(self,previous_commit=None):
         if not (self.root/'session_closed.json').is_file():raise RuntimeError('Session has no quiescent shutdown marker')
         data=json.loads((self.root/'session.json').read_text())
+        original_snapshot_sha=digest(self.root/'session.json')
+        validate_pdf(self.root/'report.pdf')
         if not data.get('tests'):raise RuntimeError('No per-jewel evidence was finalized; raw retained')
+        for record in data['tests']:
+            if (not record.get('finished') or not record.get('capture_complete')
+                    or record.get('reaction_coverage_status')=='PARTIAL'
+                    or record.get('close_reason') not in (None,'REACTION_COMPLETE')
+                    or record.get('acid_onset') is None
+                    or record['finished']<record['acid_onset']+4.9):
+                raise RuntimeError('Incomplete session is protected; originals retained')
         expected={p.resolve() for p in self.root.glob('test_*') if p.is_dir()}
-        recorded={checked_local(self.root,r['record_path']).parent for r in data['tests']}
+        recorded={self.root/checked_local(self.root,r['record_path']).parent.name for r in data['tests']}
+        if any((self.root/'deferred_recovery').glob('*.pkl')):raise RuntimeError('Pending recovery work is protected')
         if expected!=recorded:raise OSError('Some test directories lack finalized manifests; raw retained')
         for r in data['tests']:
             if r.get('classifier_input_archive_error'):raise OSError('Exact classifier-input archive failed; raw retained')
@@ -242,27 +296,61 @@ class ArchiveManager:
             if not p.is_file():raise OSError('Missing per-test manifest')
             disk=json.loads(p.read_text())
             if disk!=r:raise OSError('Session and per-test manifests disagree')
+        if previous_commit:
+            self._validated_generation(previous_commit)
         identifier=uuid.uuid4().hex
         stage=self.root/'archives'/('.staging-'+identifier);final=stage.parent/identifier
         stage.mkdir(parents=True);self._state('BUILDING',archive_id=identifier)
         mapping={};videos={};validation=[];video_sources=set();source_cache={};ffmpeg=encoder_available()
+        archive_media={}
+        image_hashes={}
+        source_assets=[]
+        video_budgets={}
+        clip_keys=('rubbing_clip','acid_clip','acid_candidate_clip','provisional_clip')
+        clip_owners=data['tests']+[p for p in data.get('recording_problems',[]) if p.get('provisional_clip')]
+        for record in clip_owners:
+            unique={c['path']:c for key in clip_keys
+                    if (c:=record.get(key)) and c.get('path')}
+            duration=sum(c['playback_seconds'] for c in unique.values())
+            for path,c in unique.items():
+                share=max(64_000,int(self.policy.target_test_bytes*.55*c['playback_seconds']/max(.001,duration)))
+                video_budgets[path]=min(video_budgets.get(path,share),share)
         def logical(p):return str(final/p.relative_to(stage))
         def copy_asset(source):
             p=checked_local(self.root,source)
             if not p.is_file():raise OSError('Missing referenced evidence: '+str(p))
+            content_sha=digest(p)
+            if p.suffix.lower() in ('.jpg','.jpeg','.png') and cv2.imread(str(p),cv2.IMREAD_UNCHANGED) is None:
+                raise OSError('Referenced original image is corrupt: '+str(p))
+            if content_sha in image_hashes:
+                mapping[str(p)]=image_hashes[content_sha]
+                source_assets.append(dict(source=str(p),sha256=content_sha,archived=image_hashes[content_sha]))
+                return image_hashes[content_sha]
             rel=p.relative_to(self.root)
-            dest=stage/('original_frames' if rel.parts[0]=='frames' else 'images')/rel
+            dest=(stage/'images'/(content_sha+p.suffix.lower()) if rel.parts[0]=='archives' else
+                  stage/('original_frames' if rel.parts[0]=='frames' else 'images')/rel)
             dest.parent.mkdir(parents=True,exist_ok=True)
             if not dest.exists():shutil.copyfile(p,dest)
-            mapping[str(p)]=logical(dest);return logical(dest)
+            if digest(dest)!=content_sha:raise OSError('Original image copy checksum mismatch')
+            mapping[str(p)]=logical(dest);image_hashes[content_sha]=logical(dest)
+            source_assets.append(dict(source=str(p),sha256=content_sha,archived=logical(dest)))
+            return logical(dest)
         for r in data['tests']:
             for name in ('rubbing_clip','acid_clip'):
                 clip=r.get(name)
                 if not clip or not clip.get('path') or not clip.get('frames'):
                     raise OSError('Required '+name+' is unavailable; raw retained')
+            if r.get('returned') is None:raise OSError('Return timestamp unavailable; originals retained')
+            for c,lo,hi in ((r['rubbing_clip'],r['started'],r['returned']),
+                            (r['acid_clip'],r['acid_onset']-2,r['acid_onset']+5)):
+                tolerance=max(.25,2/c.get('playback_fps',5))
+                if c.get('actual_start',float('inf'))>lo+tolerance or c.get('actual_end',0)<hi-tolerance:
+                    raise OSError('Required complete pickup/return or acid interval unavailable; originals retained')
+        # Unverified pickup clips remain explicitly separate from SOP tests, but
+        # receive the same post-session compression/validation/retention policy.
         # Validate and deduplicate clips before changing any canonical reference.
-        for r in data['tests']:
-            for name in ('rubbing_clip','acid_clip','acid_candidate_clip'):
+        for r in clip_owners:
+            for name in clip_keys:
                 clip=r.get(name)
                 if not clip or not clip.get('path'):continue
                 source=checked_local(self.root,clip['path'])
@@ -273,13 +361,41 @@ class ArchiveManager:
                 video_sources.add(str(source))
                 if sha not in videos:
                     dest=stage/'videos'/sha;dest.parent.mkdir(exist_ok=True)
-                    dest,codec=archive_video(source,dest,self.policy,ffmpeg)
-                    valid=validate_video(dest,clip)
-                    if valid['width']<info['width'] or valid['height']<info['height']:
-                        raise OSError('Archive video resolution shrank')
+                    encoded=archive_video(source,dest,self.policy,ffmpeg,video_budgets[clip['path']],clip)
+                    dest,codec=encoded[:2]
+                    medium=encoded[2] if len(encoded)>2 else None
+                    if medium:
+                        old_media=clip.get('archive_media')
+                        if old_media:
+                            medium['source_frame_indices']=[old_media['source_frame_indices'][i] for i in medium['source_frame_indices']]
+                            for field in ('source_width','source_height','source_frames','source_fps'):medium[field]=old_media[field]
+                        archive_media[str(source)]=medium
+                    valid=validate_video(dest,dict(clip,archive_media=medium) if medium else clip)
                     videos[sha]=(logical(dest),codec)
-                    validation.append(dict(source=str(source),archived=logical(dest),codec=codec,**valid))
+                    validation.append(dict(source=str(source),source_sha256=sha,archived=logical(dest),codec=codec,**valid))
                 mapping[str(source)]=videos[sha][0]
+                if sha in videos and str(source) not in archive_media:
+                    for prior,medium in list(archive_media.items()):
+                        if mapping.get(prior)==videos[sha][0]:archive_media[str(source)]=medium;break
+        for record in clip_owners:
+            for key in clip_keys:
+                clip=record.get(key)
+                if clip and clip.get('path'):
+                    source=str(checked_local(self.root,clip['path']))
+                    if source in archive_media:clip['archive_media']=archive_media[source]
+            # Recovery samples are timestamp references into the complete rubbing
+            # video, not a requirement to retain every duplicate camera JPEG.
+            clip=record.get('rubbing_clip') or {}
+            for sample in record.get('rubbing_contact_samples',[]):
+                ts=sample.get('timestamp');times=clip.get('timestamps',[])
+                if sample.get('source_frame') and times and times[0]<=ts<=times[-1]:
+                    sample['original_source_frame']=sample['source_frame']
+                    sample['source_frame']=mapping[str(checked_local(self.root,clip['path']))]
+                    sample['source_frame_timestamp']=ts
+                    medium=clip.get('archive_media')
+                    if medium:
+                        source_index=min(range(len(times)),key=lambda i:abs(times[i]-ts))
+                        sample['archive_frame_index']=min(range(len(medium['source_frame_indices'])),key=lambda i:abs(medium['source_frame_indices'][i]-source_index))
         # Keep exact classifier summaries for future sessions; older JPEG exports
         # can only produce explicitly labelled reconstructions.
         from acid_test.model_training.session_dataset import prepare_temporal_triplet
@@ -305,7 +421,7 @@ class ArchiveManager:
         # session and descriptive text are not followed or modified.
         media={'.jpg','.jpeg','.png','.avi','.mp4'}
         def rewrite(value):
-            if isinstance(value,dict):return {k:rewrite(v) for k,v in value.items()}
+            if isinstance(value,dict):return {k:(v if k=='original_source_frame' else rewrite(v)) for k,v in value.items()}
             if isinstance(value,list):return [rewrite(v) for v in value]
             if not isinstance(value,str):return value
             p=Path(value)
@@ -329,25 +445,28 @@ class ArchiveManager:
                     target_sidecar=target.parent/(name+'.json')
                     clip['sidecar']=logical(target_sidecar);durable_json(target_sidecar,clip)
             durable_json(target,r)
+        for problem in data.get('recording_problems',[]):
+            if not problem.get('provisional_clip'):continue
+            token=problem['event_id']
+            if Path(token).name!=token:raise ValueError('Unsafe provisional event ID')
+            target=stage/'provisional_events'/token/'manifest.json'
+            clip=problem['provisional_clip'];clip['sidecar']=logical(target.with_name('clip.json'))
+            durable_json(target.with_name('clip.json'),clip)
+            problem['provisional_manifest']=logical(target);durable_json(target,problem)
         # Retain the frame catalogue without leaving dangling raw file links.
-        index=stage/'frames.jsonl';original=self.root/'frames.jsonl'
-        video_frames={}
-        for record in data['tests']:
-            for name in ('rubbing_clip','acid_clip','acid_candidate_clip'):
-                clip=record.get(name) or {}
-                for i,ts in enumerate(clip.get('timestamps',[])):
-                    video_frames.setdefault(ts,(clip['path'],i))
-        with index.open('w') as out:
-            if original.is_file():
-                for line in original.read_text().splitlines():
-                    entry=json.loads(line);old=str(self.root/entry['file']);timestamp=entry['timestamp']
-                    entry['original_file']=entry['file'];entry['file']=mapping.get(old)
-                    entry['storage']='selected_original_image' if entry['file'] else 'not_selected_for_archive'
-                    if not entry['file'] and timestamp in video_frames:
-                        video,index_in_video=video_frames[timestamp]
-                        entry.update(file=video,frame_index=index_in_video,storage='archived_video')
-                    out.write(json.dumps(entry)+'\n')
-            out.flush();os.fsync(out.fileno())
+        original=self.root/'frames.jsonl'
+        catalogue=dict(source_index_sha256=digest(original) if original.is_file() else None,
+            source_index_bytes=original.stat().st_size if original.is_file() else 0,
+            timing_source='Per-clip sidecars preserve every original video-frame timestamp; manifests preserve event timestamps',
+            clips=[dict(cycle_id=r.get('cycle_id'),kind=k,path=c['path'],timestamps=c['timestamps'],
+                        archive_media=c.get('archive_media')) for r in data['tests']+[p for p in data.get('recording_problems',[]) if p.get('provisional_clip')]
+                   for k in clip_keys if (c:=r.get(k)) and c.get('path')])
+        durable_json(stage/'source_timestamps.json',catalogue)
+        if self.policy.retain_frame_catalogue and original.is_file():
+            # Metadata only, with raw locations explicitly historical rather than live links.
+            with original.open() as inp,(stage/'frames.jsonl').open('w') as out:
+                for line in inp:
+                    entry=json.loads(line);entry['original_file']=entry.pop('file');entry['storage']='archived_timestamps';out.write(json.dumps(entry)+'\n')
         durable_json(stage/'session.json',data)
         from audit_report import render_report
         from session_evidence import prediction_text
@@ -355,7 +474,7 @@ class ArchiveManager:
             p=Path(path)
             return stage/p.relative_to(final) if p.is_relative_to(final) else p
         render_report(stage/'report.pdf',self.root,data['jewels'],data['tests'],data.get('recording_problems',[]),prediction_text,asset_resolver=resolve)
-        if not (stage/'report.pdf').read_bytes().startswith(b'%PDF'):raise OSError('Archive PDF invalid')
+        validate_pdf(stage/'report.pdf')
         # Check rewritten media references and all expected source images now.
         def verify_refs(v):
             if isinstance(v,dict):
@@ -367,8 +486,15 @@ class ArchiveManager:
         verify_refs(data)
         files={str(p.relative_to(stage)):dict(sha256=digest(p),bytes=p.stat().st_size)
                for p in stage.rglob('*') if p.is_file()}
-        manifest=dict(schema='jewel_evidence_archive_v1',session_id=self.root.name,archive_id=identifier,
-            created_at=time.time(),files=files,videos=validation,video_sources=sorted(video_sources),policy=asdict(self.policy))
+        manifest=dict(schema='jewel_evidence_archive_v2',storage_profile='compact_v2',session_id=self.root.name,archive_id=identifier,
+            created_at=time.time(),files=files,videos=validation,video_sources=sorted(video_sources),source_assets=source_assets,
+            source_session_sha256=original_snapshot_sha,source_session_ended_at=max(r['finished'] for r in data['tests']),
+            policy=asdict(self.policy))
+        if previous_commit:manifest['superseded_commits']=[previous_commit]
+        from historical_cleanup import per_test_sizes
+        for _ in range(5):
+            extra=len(json.dumps(manifest,indent=2).encode())
+            manifest['test_sizes']=per_test_sizes(data,files,final,self.policy.target_test_bytes,extra)
         durable_json(stage/'archive_manifest.json',manifest)
         for p in stage.rglob('*'):
             if p.is_file():
@@ -386,24 +512,32 @@ class ArchiveManager:
     def _publish(self,final,data):
         for name in ('report.pdf','session.json','frames.jsonl'):
             temp=self.root/('.publish-'+uuid.uuid4().hex)
+            if not (final/name).is_file():continue
             shutil.copyfile(final/name,temp)
             with temp.open('rb') as f:os.fsync(f.fileno())
             os.replace(temp,self.root/name)
         for r in data['tests']:
             source=Path(r['record_path']);folder=self.root/source.parent.name
             durable_json(folder/'manifest.json',r)
+        for problem in data.get('recording_problems',[]):
+            if problem.get('provisional_manifest'):
+                target=checked_local(self.root,self.root/'provisional_events'/problem['event_id']/'manifest.json')
+                durable_json(target,problem)
         sync_directory(self.root)
 
-    def _validated_generation(self,commit):
-        final=checked_local(self.root,self.root/'archives'/commit['archive_id'])
+    def _validated_archive_path(self,final,expected_sha):
         manifest=final/'archive_manifest.json'
-        if digest(manifest)!=commit['manifest_sha256']:raise OSError('Archive manifest checksum mismatch')
+        if digest(manifest)!=expected_sha:raise OSError('Archive manifest checksum mismatch')
         content=json.loads(manifest.read_text())
         for rel,item in content['files'].items():
             p=checked_local(final,rel)
             if not p.is_file() or p.stat().st_size!=item['bytes'] or digest(p)!=item['sha256']:
                 raise OSError('Archived evidence checksum mismatch: '+rel)
         return final,json.loads((final/'session.json').read_text())
+
+    def _validated_generation(self,commit):
+        final=checked_local(self.root,self.root/'archives'/commit['archive_id'])
+        return self._validated_archive_path(final,commit['manifest_sha256'])
 
     def validate_commit(self,republish=True):
         commit=json.loads((self.root/'archive_commit.json').read_text())
@@ -414,12 +548,40 @@ class ArchiveManager:
     def _cleanup(self,commit):
         if not self.policy.cleanup_raw_after_archive:
             self._state('COMMITTED_RAW_RETAINED');return dict(status='raw_retained')
+        final=self.root/'archives'/commit['archive_id']
+        archive_metadata=json.loads((final/'archive_manifest.json').read_text())
+        ended=archive_metadata.get('source_session_ended_at',commit['committed_at'])
+        if time.time()-ended<self.policy.original_min_retention_days*86400:
+            self._state('BANK_ORIGINAL_RETENTION_HOLD',archive_id=commit['archive_id'])
+            return dict(status='bank_original_retention_hold')
         if not valid_ack(self.root,commit,self.policy):
             self._state('AWAITING_SERVER_ACK',archive_id=commit['archive_id'])
             return dict(status='awaiting_server_ack',manifest_sha256=commit['manifest_sha256'])
         self.validate_commit(republish=False)
         final=self.root/'archives'/commit['archive_id'];data=json.loads((final/'session.json').read_text())
+        if any(not r.get('capture_complete') or r.get('reaction_coverage_status')=='PARTIAL'
+               or r.get('close_reason') not in (None,'REACTION_COMPLETE') for r in data['tests']):
+            self._state('INCOMPLETE_SESSION_PROTECTED',archive_id=commit['archive_id'])
+            return dict(status='incomplete_session_protected')
         candidates=[self.root/'frames']
+        authorization=self.root/'cleanup_authorization.json'
+        previous_authorization=json.loads(authorization.read_text()) if authorization.exists() else {}
+        already_authorized=previous_authorization.get('manifest_sha256')==commit['manifest_sha256']
+        for superseded in archive_metadata.get('superseded_commits',[]):
+            old_final=checked_local(self.root,self.root/'archives'/superseded['archive_id'])
+            relocated=self.root/'.cleanup'/commit['archive_id']/'archives'/superseded['archive_id']
+            # Validate originals before authorizing their atomic rename. A durable
+            # authorization permits retry after a crash midway through tomb removal.
+            if old_final.exists() or not already_authorized:
+                self._validated_archive_path(old_final if old_final.exists() else relocated,superseded['manifest_sha256'])
+            if old_final==final:raise OSError('Cannot supersede the active archive')
+            candidates.append(old_final)
+        if not self.policy.retain_frame_catalogue:
+            index=self.root/'frames.jsonl'
+            timing=(json.loads((final/'source_timestamps.json').read_text()) if (final/'source_timestamps.json').exists() else
+                    dict(source_index_sha256=digest(final/'frames.jsonl') if (final/'frames.jsonl').exists() else None))
+            if index.is_file() and timing.get('source_index_sha256')!=digest(index):raise OSError('Raw timestamp index changed; originals retained')
+            candidates.append(index)
         for r in data['tests']:
             folder=self.root/Path(r['record_path']).parent.name
             candidates.extend(folder/name for name in ('baseline','application','reaction')
@@ -427,6 +589,22 @@ class ArchiveManager:
             # Only remove original video exports catalogued in the archive.
         manifest=json.loads((final/'archive_manifest.json').read_text())
         candidates.extend(checked_local(self.root,source) for source in manifest['video_sources'])
+        for asset in manifest.get('source_assets',[]):
+            source=checked_local(self.root,asset['source'])
+            if source.is_file() and digest(source)!=asset['sha256']:raise OSError('Original selected asset changed before cleanup')
+            candidates.append(source)
+        # Only known publication/recorder temporaries; unknown files remain protected.
+        retained_hashes={item['sha256'] for item in manifest['files'].values()}
+        source_video_hashes={item.get('source_sha256') for item in manifest['videos']}
+        for folder in self.root.glob('test_*'):
+            for image in folder.iterdir():
+                if image.is_file() and not image.is_symlink() and image.suffix.lower() in ('.jpg','.jpeg','.png','.avi'):
+                    known=source_video_hashes if image.suffix.lower()=='.avi' else retained_hashes
+                    if digest(image) in known:candidates.append(image)
+        candidates.extend(self.root.glob('.publish-*'))
+        candidates.extend(self.root.glob('frames.pruning.tmp'))
+        candidates.extend((self.root/'archives').glob('.staging-*'))
+        durable_json(authorization,dict(manifest_sha256=commit['manifest_sha256'],authorized_at=time.time()))
         trash=self.root/'.cleanup'/commit['archive_id'];trash.mkdir(parents=True,exist_ok=True)
         self._state('CLEANING',archive_id=commit['archive_id'])
         deleted=0
@@ -491,6 +669,10 @@ def main():
                 print(json.dumps(dict(session=str(root),acknowledged=acknowledged,expired=expired,apply=args.apply)))
                 if args.apply:
                     manager.validate_commit()
+                    final,data=manager._validated_generation(commit)
+                    if any(not r.get('capture_complete') or r.get('reaction_coverage_status')=='PARTIAL'
+                           or r.get('close_reason') not in (None,'REACTION_COMPLETE') for r in data['tests']):
+                        print(json.dumps(dict(session=str(root),status='incomplete_session_protected')));continue
                     if acknowledged and expired:
                         # Retention expiry deletes whole closed sessions only with
                         # policy-authorized receipt and validated checksums.

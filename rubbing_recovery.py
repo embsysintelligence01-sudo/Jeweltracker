@@ -15,18 +15,33 @@ def recover_contact(journal, cycle, observer, save_picture):
     # Tracking can report a return before the operator finishes rubbing. The
     # timestamped live source is stronger evidence than that return heuristic.
     # Keep it only inside this cycle and strictly before acid application.
-    valid_live=(not cycle.get('overlap_trigger_required') or cycle.get('rubbing_started_at') is not None) and (live is not None and live.get('frame') is not None
+    valid_live=(live is not None and live.get('frame') is not None
                 and start<=live['timestamp']<=cycle['finished']
                 and (cutoff is None or live['timestamp']<=cutoff)
                 and (cycle.get('acid_onset') is None or live['timestamp']<cycle['acid_onset']))
     return_precedes_contact=bool(valid_live and live['timestamp']>end)
     if valid_live:
         end=max(end,live['timestamp'])
-    armed=not cycle.get('overlap_trigger_required') or cycle.get('rubbing_started_at') is not None
-    evidence_start=max(start,(cycle.get('rubbing_started_at') or start)-.2)
-    entries=journal.between(evidence_start,end,fps=6) if armed else []
+    # A missed live overlap must never disable recovery. The pickup window
+    # defines ownership; pre-roll is retained in the clip, not attributed as rub.
+    entries=journal.between(start,end,fps=15)
     limit=cycle.get('recovery_contact_frames',24)
-    indices=np.unique(np.linspace(0,len(entries)-1,min(limit,len(entries)),dtype=int))
+    # Keep the same inference/read budget. Prioritize frames near observed stone
+    # activity so uniform sampling doesn't discard a very short contact event.
+    priority=[]
+    if entries:
+        times=np.array([entry['timestamp'] for entry in entries])
+        for timestamp in cycle.get('rubbing_activity_timestamps',[]):
+            if start<=timestamp<=end:
+                for delta in (0,-.07,.07):priority.append(int(np.argmin(np.abs(times-timestamp-delta))))
+    priority=list(dict.fromkeys(priority))
+    if len(priority)>limit//2:
+        priority=[priority[i] for i in np.linspace(0,len(priority)-1,limit//2,dtype=int)]
+    selected_indices=set(priority)
+    for i in np.linspace(0,len(entries)-1,min(limit,len(entries)),dtype=int):
+        if len(selected_indices)>=limit:break
+        selected_indices.add(int(i))
+    indices=sorted(selected_indices)
     observations=cycle.get('stone_observations',[])
     selected=None
     samples=[]

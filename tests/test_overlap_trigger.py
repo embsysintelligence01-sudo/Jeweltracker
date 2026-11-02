@@ -15,16 +15,14 @@ class OverlapTriggerTests(unittest.TestCase):
     def observe(self,w,ts=None):
         w._observe_stone_contact(scene(),time.time() if ts is None else ts,STONE,w.flow_revision,'j1')
 
-    def test_two_distinct_overlap_frames_required_not_duplicate_snapshot(self):
+    def test_first_contact_is_retained_without_confirming_rubbing(self):
         w=self.worker();ts=time.time()
         self.observe(w,ts)
-        self.assertIsNone(w.rubber.ev)
-        self.observe(w,ts)
-        self.assertIsNone(w.rubber.ev)
-        self.observe(w)
         self.assertIsNotNone(w.rubber.ev)
-        self.assertEqual(2,w.continuous_overlap_trigger['frames'])
         self.assertFalse(w.rubber.rubbing)
+        self.observe(w,ts)
+        self.assertFalse(w.rubber.rubbing)
+        self.assertIsNone(w.continuous_overlap_trigger)
 
     def test_no_jewel_or_border_only_mask_does_not_trigger(self):
         for poly in (None,np.float32([[218,65],[224,65],[224,195],[218,195]])):
@@ -35,34 +33,32 @@ class OverlapTriggerTests(unittest.TestCase):
                 self.assertIsNone(w.rubber.ev)
                 self.assertIsNone(w.continuous_overlap_trigger)
 
-    def test_a_missed_detection_breaks_consecutive_overlap(self):
+    def test_missed_detection_does_not_require_a_new_two_frame_overlap(self):
         w=self.worker();gold=w.gold_observation
         self.observe(w);w.gold_observation=([],[]);self.observe(w)
         w.gold_observation=gold;self.observe(w)
+        self.assertIsNotNone(w.rubber.ev)
         self.assertIsNone(w.continuous_overlap_trigger)
-        self.observe(w);self.assertIsNotNone(w.continuous_overlap_trigger)
+        self.assertFalse(w.rubber.rubbing)
 
-    def test_pickup_or_false_return_cannot_start_rubbing_or_baseline_before_overlap(self):
+    def test_old_overlap_flag_does_not_disable_contact_or_reliable_return(self):
         with monitor_case() as (m,events):
             s=snap(100,held=1);s['overlap_trigger_required']=True
             m.step(s);a=m.active
-            for ts in (100.2,100.4,100.8):
-                s=snap(ts,contact=contact(ts,confirmed=True));s['overlap_trigger_required']=True
-                m.step(s)
-            self.assertIsNone(a['contact']);self.assertIsNone(a['baseline_at'])
-            self.assertIsNone(a['returned'])
-            self.assertFalse(any(k=='contact' for k,_ in events))
-            self.assertEqual('WAIT_FOR_CONTACT',m.phase[1])
+            m.step(snap(100.1,held=1,contact=contact(100.1,confirmed=False)))
+            self.assertIsNotNone(a['contact']);self.assertFalse(a['live_rub'])
+            self.assertIsNone(a['baseline_at'])
+            for ts in (100.4,100.6,101,101.8):m.step(snap(ts))
+            self.assertIsNotNone(a['returned']);self.assertIsNotNone(a['baseline_at'])
 
-    def test_matching_cycle_trigger_arms_possible_contact_and_wrong_token_does_not(self):
+    def test_wrong_contact_token_is_rejected_without_an_overlap_gate(self):
         with monitor_case() as (m,events):
-            s=snap(100,held=1);s['overlap_trigger_required']=True;m.step(s);a=m.active
+            m.step(snap(100,held=1));a=m.active
             for token,ts in (('old',100.2),(a['id'],100.4)):
-                s=snap(ts,held=1,contact=contact(ts,confirmed=False))
-                s.update(overlap_trigger_required=True,rubbing_trigger=dict(timestamp=100.1,confirmed_at=ts,frames=2,cycle_token=token))
-                m.step(s)
+                c=dict(contact(ts,confirmed=False),cycle_token=token)
+                m.step(snap(ts,held=1,contact=c))
                 if token=='old':self.assertIsNone(a['contact'])
-            self.assertEqual(100.1,a['rubbing_started_at'])
+            self.assertEqual(100.4,a['rubbing_started_at'])
             self.assertIsNotNone(a['contact']);self.assertFalse(a['live_rub'])
 
 class MotionEdgeRejectionTests(unittest.TestCase):
@@ -73,7 +69,7 @@ class MotionEdgeRejectionTests(unittest.TestCase):
         _,motion=local_motion(previous,new,STONE)
         self.assertIsNone(motion)
 
-    def test_no_overlap_trigger_disables_motion_only_recorded_recovery(self):
+    def test_missed_live_overlap_still_allows_unverified_recorded_recovery(self):
         import tempfile
         from pathlib import Path
         from session_evidence import FrameJournal
@@ -81,12 +77,13 @@ class MotionEdgeRejectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             journal=FrameJournal(tmp)
             for i in range(4):journal.offer(scene(),100+i*.1)
-            journal.close();observer=Mock()
+            journal.close();observer=Mock(return_value=None)
             cycle=dict(started=100,returned=100.3,finished=101,acid_onset=None,
                 overlap_trigger_required=True,rubbing_started_at=None,
                 directory=Path(tmp),stone_observations=[(100,STONE)])
             result=recover_contact(journal,cycle,observer,Mock())
             self.assertEqual('CONTACT_NOT_VISIBLE',result['rubbing_contact_status'])
-            observer.assert_not_called()
+            self.assertGreater(observer.call_count,0)
+            self.assertFalse(result['rubbing_verified'])
 
 if __name__=='__main__':unittest.main()

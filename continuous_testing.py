@@ -35,7 +35,8 @@ HAND = {'IN_HAND', 'UNDER_HAND'}
 # Trial policy: covered jewels remain tracked, but cannot start a test cycle.
 PICKUP_STATES = {'IN_HAND'}
 PHASE_TITLES = {
-    'WAIT_FOR_CONTACT': 'WAITING FOR JEWEL / STONE OVERLAP',
+    'WAIT_FOR_CONTACT': 'WAITING FOR PICKUP EVIDENCE',
+    'OCCLUDED_HOME': 'HOME COVERED / PROVISIONAL RECORDING',
     'CONTACT_POSSIBLE': 'POSSIBLE JEWEL CONTACT / RECORDING',
     'BEFORE_CAPTURE': 'CAPTURING BEFORE STONE', 'BEFORE_READY': 'BEFORE STONE CAPTURED',
     'WAIT_FOR_STONE': 'WAITING FOR CLEAR STONE', 'RUBBING': 'RUBBING CONTACT OBSERVED',
@@ -99,6 +100,7 @@ def evidence_reason(message):
 
 def visibility(track, timestamp, bench_moving):
     """Use the same evidence as the tracker's hand labels, never absence alone."""
+    if track.get('state')=='OCCLUDED_HOME':return 'UNDER_HAND'
     if track.get('in_hand'):
         return 'IN_HAND'
     if track.get('spot') == 'hand':
@@ -355,6 +357,7 @@ class ContinuousMonitor(threading.Thread):
         self.area_job = None
         self.recovery_job = None
         self.active = None
+        self.pickup_windows={};self.pickup_events=set();self.unverified_pickups=[]
         self.last_ts = self.last_photo = self.last_detection = self.last_reference = -1e9
         self.last_acid_ts, self.last_acid_present = -1e9, True
         self.placement = None
@@ -397,11 +400,15 @@ class ContinuousMonitor(threading.Thread):
             if self.active is not None:
                 self._finish(self.last_ts, 'Session ended during the test.')
         finally:
+            for window in list(self.pickup_windows.values()):self._close_pickup_window(window,self.last_ts,'Session closed before departure confirmation')
+            self.pickup_windows.clear()
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.detector_pool.shutdown(wait=True, cancel_futures=True)
             self.journal.close()
             self.drain_finalization()
             self.finish_pool.shutdown(wait=True)
+            for window in self.unverified_pickups:
+                if window.get('future') is None:self._save_unverified_pickup(window)
             self.report_pool.shutdown(wait=True)
             self._close_intervals(self.last_ts)
             try:
@@ -482,7 +489,84 @@ class ContinuousMonitor(threading.Thread):
             a['residue_warning']=warning
             a['issues'].append(warning)
 
-    def _new_cycle(self, jid, snap, ts):
+    def _save_unverified_pickup(self,window):
+        try:
+            folder=self.directory/'provisional_events'/window['token'];folder.mkdir(parents=True,exist_ok=True)
+            self.journal.flush_through(window['end'],timeout=1.)  # bounded background flush
+            clip=self.journal.clip(window['started']-1.5,window['end'],folder/'pickup_unverified.avi')
+            if not clip.get('path') or not clip.get('frames'):raise OSError('Provisional window has no recorded frames')
+            with self.journal.lock:
+                window['problem']['provisional_clip']=clip
+                window['problem']['provisional_manifest']=str(folder/'manifest.json')
+                saved=copy.deepcopy(window['problem'])
+            atomic_json(folder/'manifest.json',saved)
+            self.report_dirty=True
+        except Exception as exc:
+            self.finalization_errors.append('Provisional evidence export: '+str(exc))
+            self.journal.problem('Unverified pickup clip export failed; raw evidence retained',window['started'],window['end'])
+            return
+        self.journal.release_interval(window['token'])
+
+    def _close_pickup_window(self,window,timestamp,reason):
+        for field in ('frame','reference','motion_frame'):window.pop(field,None)
+        self.journal.finish_interval(window['token'],timestamp)
+        if not window['stone_activity']:
+            self.journal.release_interval(window['token'])
+        else:
+            # Motion supports retention, never pickup or rubbing confirmation.
+            window.update(end=timestamp,reason=reason,future=None)
+            self.unverified_pickups.append(window)
+            problem=dict(reason='Unverified pickup J'+str(window['jewel_id'])+': '+reason,
+                start=window['started'],end=timestamp,count=1,jewel_id=window['jewel_id'],
+                status='UNVERIFIED_PICKUP',event_id=window['token'],provisional_clip=None)
+            window['problem']=problem
+            with self.journal.lock:self.journal.problems.append(problem)
+            pending=sum(w.get('future') is not None and not w['future'].done() for w in self.unverified_pickups)
+            if pending<2:window['future']=self.finish_pool.submit(self._save_unverified_pickup,window)
+        self.emit('status',message='J'+str(window['jewel_id'])+': '+reason+'. Acid testing was not started.')
+
+    def _pickup_candidate(self,snap,stone):
+        ts=snap['timestamp'];tracks=[tr for tr in snap['tracks'] if not tr.get('acid_done') and tr['id'] not in self.captured_ids]
+        active_id=self.active['jewel_id'] if self.active else None
+        for tr in tracks:
+            if tr['id']==active_id:continue
+            pickup=tr.get('pickup') or {};event=(tr['id'],pickup.get('event',0))
+            if (not pickup.get('enabled') or not pickup.get('event') or pickup.get('started') is None
+                    or not 0<=ts-pickup.get('observed_at',-1e9)<=.75):continue
+            window=self.pickup_windows.get(event)
+            if window is None and event not in self.pickup_events and pickup['state'] not in ('CANCELLED','AT_HOME'):
+                window=dict(token='pickup_'+str(tr['id'])+'_'+uuid.uuid4().hex[:10],jewel_id=tr['id'],
+                    started=pickup['started'],pickup=copy.deepcopy(pickup),frame=snap['frame'].copy(),frame_timestamp=ts,
+                    stone_observations=deque(maxlen=240),activity_timestamps=deque(maxlen=120),
+                    reference=self.reference,stone_activity=False,motion_frame=None,last_sample=-1e9)
+                self.pickup_windows[event]=window;self.pickup_events.add(event)
+                self.journal.pin_interval(window['token'],pickup['started']-1.5)
+                self.emit('status',message='J'+str(tr['id'])+' home covered/changed: provisional evidence retained with 1.5 s pre-roll; pickup not yet confirmed.')
+            if window is None:continue
+            window['pickup']=copy.deepcopy(pickup)
+            if stone is not None and ts-window['last_sample']>=.15:
+                window['last_sample']=ts
+                window['stone_observations'].append((ts,tuple(int(v) for v in stone)))
+                window['motion_frame'],motion=local_motion(window['motion_frame'],snap['frame'],stone,allow_broad=True)
+                window['stone_activity'] |= motion is not None
+                if motion is not None:window['activity_timestamps'].append(ts)
+            if pickup['state']=='CANCELLED':
+                self._close_pickup_window(window,ts,'Jewel remained at home; false pickup cancelled')
+                del self.pickup_windows[event]
+        windows=[w for w in self.pickup_windows.values() if w['jewel_id']!=active_id]
+        # Both homes covered is ambiguous. Do not let order or bbox size choose J1/J2.
+        if len(windows)!=1:return None
+        window=windows[0]
+        if window['pickup'].get('departed_at') is None:return None
+        return window
+
+    def _adopt_pickup(self,window,snap):
+        self._new_cycle(window['jewel_id'],snap,window['started'],window)
+        self.journal.release_interval(window['token'])  # the actual test now pins the whole interval
+        key=(window['jewel_id'],window['pickup']['event'])
+        self.pickup_windows.pop(key,None)
+
+    def _new_cycle(self, jid, snap, ts, window=None):
         # Finalizers keep saving earlier evidence, but may not run any more acid
         # searches after another jewellery cycle owns the camera process.
         for cancelled in self.acid_cancellations.values():cancelled.set()
@@ -492,12 +576,15 @@ class ContinuousMonitor(threading.Thread):
         self.last_photo=-1e9
         self.active = dict(id=directory.name, directory=directory, jewel_id=jid,
             started=ts, returned=None, acid_onset=None, finished=None,
-            overlap_trigger_required=bool(snap.get('overlap_trigger_required',False)),rubbing_started_at=None,
-            reference=self.reference, mask=None, mask_candidate=None, mask_status='UNCONFIRMED',
+            overlap_trigger_required=False,rubbing_started_at=None,
+            home_tracking=bool(window),pickup_confirmed=True,evidence_start=ts-1.5,
+            pickup_confirmed_at=window['pickup']['departed_at'] if window else ts,
+            pickup_home=copy.deepcopy(window['pickup']) if window else None,
+            reference=window['reference'] if window else self.reference, mask=None, mask_candidate=None, mask_status='UNCONFIRMED',
             mask_reason='No clear new rubbing mask confirmed yet.', live_rub=False,
             rubbing_status='UNCONFIRMED', identity_status='IN_HAND' if jid else 'MISSED_OR_AMBIGUOUS',
             issues=[], poses=[], coverage_since=None, reaction_end=None,
-            detector_bbox=None, pickup_image=self._picture(directory, 'pickup', snap['frame']),
+            detector_bbox=None, pickup_image=self._picture(directory, 'pickup', window['frame'] if window else snap['frame']),
             return_frame=None, version=snap['revision'], ph_status='Not observed in continuous capture',
             baseline_at=None, mask_decision_at=None, phase_events=[], acid_checks=[],
             stop_search=threading.Event(), recovery_cursor=None, last_recovery=-1e9)
@@ -506,11 +593,14 @@ class ContinuousMonitor(threading.Thread):
         self.cycle_versions[directory.name]=snap['revision']
         self.active.update(placement=None if self.placement is None else self.placement.copy(),contact=None, contact_region=None, mask_evidence_status="NOT_ESTABLISHED",
                            last_activity=ts, activity_frame=None, rejected_mask=None, unverified_mask=None,
-                           pickup_image_timestamp=ts,recovery_contact_frames=self.recovery_contact_frames,
+                           pickup_image_timestamp=window['frame_timestamp'] if window else ts,recovery_contact_frames=self.recovery_contact_frames,
                            previous_acid_mask=self.acid_history.mask.copy(), fresh_gate=None,
                            fresh_acid_status='WAITING_FOR_BASELINE', stone_observations=[],
                            application_verifier=None, acid_candidate_events=[],
                            contact_closed_at=None, contact_close_reason=None, return_probe=None)
+        if window is not None:
+            self.active['stone_observations']=list(window['stone_observations'])
+            self.active['rubbing_activity_timestamps']=list(window['activity_timestamps'])
         self._residue_snapshot(self.active,self.acid_history.snapshot(ts))
         if self.active['reference'] is None and self.reference_job is None:
             candidates=[c for c in self.clear_history if ts-3<=c[0]<ts]
@@ -885,6 +975,11 @@ class ContinuousMonitor(threading.Thread):
 
     @staticmethod
     def _reliable_return(a, own, visible, timestamp):
+        if a.get('home_tracking'):
+            p=own.get('pickup') if own else None
+            return bool(visible and p and a.get('pickup_confirmed') and p.get('departed_at') is not None
+                        and p.get('returned_at') is not None and p['started']==a['started']
+                        and own.get('in_bed') and 0<=timestamp-own['det_seen']<=.4)
         if own is None or a.get('identity_status') == 'MISSED_DURING_PROCESS':
             return visible  # Existing identity-missed placement policy stays explicit.
         seen=own.get('det_seen',-1e9)
@@ -901,8 +996,6 @@ class ContinuousMonitor(threading.Thread):
         return probe['count']>=2 and timestamp-probe['start']>=.12
 
     def _contact(self,a,contact,owner_on_bed=False):
-        if a.get('overlap_trigger_required') and a.get('rubbing_started_at') is None:
-            return
         if (owner_on_bed or a.get('contact_closed_at') is not None
                 or a.get('returned') is not None or a.get('mask') is not None
                 or a.get('baseline_at') is not None):
@@ -914,6 +1007,7 @@ class ContinuousMonitor(threading.Thread):
         if a.get('last_contact_ts',-1)>=contact['timestamp']:
             return
         a['last_contact_ts']=contact['timestamp']
+        if a.get('rubbing_started_at') is None:a['rubbing_started_at']=contact['timestamp']
         quad=self._quad_at(a,contact['timestamp'])
         region=contact_region(contact,quad)
         was_confirmed=a['live_rub']
@@ -1048,6 +1142,8 @@ class ContinuousMonitor(threading.Thread):
                 if self.mask_job is not None:
                     self.mask_job[0].cancel()
                     self.mask_job = None
+            for window in list(self.pickup_windows.values()):self._close_pickup_window(window,previous_ts,'Tracking ROI/reset changed; pickup unconfirmed')
+            self.pickup_windows.clear();self.pickup_events.clear()
             self.revision = snap['revision']
             self.pose, self.reference = StonePose(), None
             self.clear_history.clear()
@@ -1080,6 +1176,7 @@ class ContinuousMonitor(threading.Thread):
             if self.placement is None or not np.array_equal(placement, self.placement):
                 self.placement = placement
                 self.emit('placement', roi=self.placement)
+        tracker_pickup=self._pickup_candidate(snap,stone) if snap.get('home_tracking') and snap['mode']=='LOCKED' else None
         eligible_tracks = [tr for tr in snap['tracks'] if tr['id'] not in self.captured_ids]
         candidate = choose_hand_jewel(eligible_tracks, ts, snap['bench_moving'], self.recent_hand)
         current_hand = [tr for tr in eligible_tracks if not tr.get('acid_done')
@@ -1087,14 +1184,17 @@ class ContinuousMonitor(threading.Thread):
         pickup = any(visibility(tr, ts, snap['bench_moving']) in PICKUP_STATES for tr in current_hand)
         a = self.active
         # Handoff requires repeated actual, fresh in-hand detections of J2.
-        reliable=[tr for tr in eligible_tracks if tr.get('in_hand') and visibility(tr,ts,snap['bench_moving'])=='IN_HAND' and
+        reliable=[tr for tr in eligible_tracks if not snap.get('home_tracking') and tr.get('in_hand') and visibility(tr,ts,snap['bench_moving'])=='IN_HAND' and
                   0<=ts-tr['det_seen']<=.75 and (a is None or tr['id']!=a['jewel_id'])]
+        if a and tracker_pickup is not None:
+            reliable=[tr for tr in eligible_tracks if tr['id']==tracker_pickup['jewel_id']]
         if a and len(reliable)==1:
             tr=reliable[0]
+            evidence_seen=(tracker_pickup['pickup']['observed_at'] if tracker_pickup else tr['det_seen'])
             if self.next_pickup is None or self.next_pickup['id']!=tr['id'] or ts-self.next_pickup['last_frame']>.75:
-                self.next_pickup=dict(id=tr['id'],start=ts,last_seen=tr['det_seen'],count=1,last_frame=ts)
-            elif tr['det_seen']>self.next_pickup['last_seen']:
-                self.next_pickup['last_seen']=tr['det_seen']
+                self.next_pickup=dict(id=tr['id'],start=ts,last_seen=evidence_seen,count=1,last_frame=ts)
+            elif evidence_seen>self.next_pickup['last_seen']:
+                self.next_pickup['last_seen']=evidence_seen
                 self.next_pickup['count']+=1
             self.next_pickup['last_frame']=ts
             if self.next_pickup['count']>=2 and ts-self.next_pickup['start']>=self.pickup_debounce:
@@ -1102,8 +1202,8 @@ class ContinuousMonitor(threading.Thread):
                 issue=('Acid not confirmed before the next jewel was reliably picked up.' if a['acid_onset'] is None else
                        'Next jewel picked up; previous reaction evidence ends at that pickup.')
                 self._finish(boundary,issue,reason='NEXT_JEWEL_PICKUP')
-                self._new_cycle(tr['id'],snap,boundary)
-                self.active['pickup_image_timestamp']=ts
+                if tracker_pickup is not None:self._adopt_pickup(tracker_pickup,snap)
+                else:self._new_cycle(tr['id'],snap,boundary)
                 a=self.active
                 self.next_pickup=None
         else:
@@ -1111,20 +1211,12 @@ class ContinuousMonitor(threading.Thread):
         if a is not None and self.next_pickup is None and a.get('pending_acid') is not None:
             observed,best,recovered=a.pop('pending_acid')
             self._set_acid(a,observed,best,recovered)
-        if a is None and snap['mode'] == 'LOCKED' and pickup:
-            self._new_cycle(candidate, snap, ts)
-            a = self.active
+        if a is None and snap['mode'] == 'LOCKED':
+            if tracker_pickup is not None:self._adopt_pickup(tracker_pickup,snap)
+            elif pickup and not snap.get('home_tracking'):self._new_cycle(candidate,snap,ts)
+            a=self.active
         if a is not None:
-            trigger=snap.get('rubbing_trigger')
-            if (a.get('overlap_trigger_required') and a.get('rubbing_started_at') is None
-                    and trigger and trigger.get('cycle_token')==a['id']
-                    and trigger.get('frames',0)>=2 and a['started']<=trigger['timestamp']<=ts
-                    and 0<=ts-trigger['confirmed_at']<=.75):
-                a['rubbing_started_at']=trigger['timestamp']
-                a['rubbing_trigger_confirmed_at']=trigger['confirmed_at']
-                a['last_activity']=ts
-                self._phase('CONTACT_POSSIBLE','Jewel overlaps stone in two inference frames; recording possible contact. Rubbing is not yet confirmed.',a)
-            contact_armed=not a.get('overlap_trigger_required') or a.get('rubbing_started_at') is not None
+            contact_armed=True  # Recording is independent of stone overlap.
             if stone is not None:
                 a['stone_observations'].append((ts, tuple(int(v) for v in stone)))
             if clear:
@@ -1145,9 +1237,9 @@ class ContinuousMonitor(threading.Thread):
                 b = own['box']
                 intersection = max(0, min(b[2], stone[2])-max(b[0], stone[0]))*max(0, min(b[3], stone[3])-max(b[1], stone[1]))
                 returned = intersection/max(1., (b[2]-b[0])*(b[3]-b[1])) < .05
-            if own is None or a['identity_status'] == 'MISSED_DURING_PROCESS':
+            if own is None or (a['identity_status'] == 'MISSED_DURING_PROCESS' and not a.get('home_tracking')):
                 # Keep the camera process moving, but never relabel this as a returned jewel.
-                returned = clear and ts-a.get('last_rub', a['started']) >= 2
+                returned = not a.get('home_tracking') and clear and ts-a.get('last_rub', a['started']) >= 2
             self._contact(a,snap.get('contact'),owner_on_bed=returned)
             reliable_return=self._reliable_return(a,own,returned and clear,ts)
             # Prepare a candidate as soon as the stone clears, before waiting
@@ -1184,7 +1276,9 @@ class ContinuousMonitor(threading.Thread):
                 if a['reference'] is None:
                     a['mask_reason'] = 'No clear pre-rubbing reference was available.'
                 if a.get('baseline_at') is None:
-                    if a['mask'] is not None or a.get('mask_attempt_at', -1e9) >= a['returned'] or ts >= a['decision_deadline']:
+                    if ((a['mask'] is not None or a.get('mask_attempt_at', -1e9) >= a['returned'] or ts >= a['decision_deadline'])
+                            and clear and not occupied and self.pose.stable_since is not None
+                            and ts-self.pose.stable_since>=.1 and inside_roi(self.pose.quad,self.placement)):
                         self._baseline(a, frame, ts)
                     else:
                         self._phase('MASK_CHECK', 'New rubbed mask: checking. Baseline begins after this check.', a)
@@ -1283,7 +1377,7 @@ class ContinuousMonitor(threading.Thread):
                                  baseline_sample)
             self.acid_job = self.detector_pool.submit(self._detect, source, source_ts,
                 box_of(quad) if baseline_sample and quad is not None else stone, a['id'] if a else None)
-        if (idle and not current_hand and clear and self.reference_job is None
+        if (idle and not current_hand and not self.pickup_windows and clear and self.reference_job is None
                 and ts-self.last_reference >= 2 and ts-self.last_acid_ts < 1):
             self.last_reference = ts
             self._phase('BEFORE_CAPTURE', 'Capturing the clear stone before rubbing.')
@@ -1316,8 +1410,6 @@ class ContinuousMonitor(threading.Thread):
             self.captured_ids.add(a['jewel_id'])
         a.setdefault('stop_search', threading.Event()).set()
         self.last_capture_end = ts
-        if a.get('overlap_trigger_required') and a.get('rubbing_started_at') is None:
-            a['issues'].append('No two-frame jewellery overlap inside the stone was observed; rubbing evidence and baseline were not started.')
         if issue:
             a['issues'].append(issue)
         intervals = []
@@ -1402,7 +1494,7 @@ class ContinuousMonitor(threading.Thread):
                 'mask_status', 'mask_reason', 'identity_status', 'ph_status', 'issues', 'visibility', 'pickup_image',
                 'baseline_at', 'mask_decision_at', 'baseline_start_image', 'phase_events', 'acid_checks',
                 'fresh_acid_status', 'fresh_acid_evidence', 'baseline_acid_detections', 'acid_jewel_association',
-                'close_reason','mask_evidence_status','pickup_image_timestamp','reaction_end','coverage_since','reaction_interrupted_at','confirmed_classification_region','overlap_trigger_required','rubbing_started_at','rubbing_trigger_confirmed_at')
+                'close_reason','mask_evidence_status','pickup_image_timestamp','reaction_end','coverage_since','reaction_interrupted_at','confirmed_classification_region','overlap_trigger_required','rubbing_started_at','rubbing_trigger_confirmed_at','home_tracking','pickup_confirmed','pickup_confirmed_at','pickup_home','evidence_start','rubbing_activity_timestamps')
         keys += ('application_candidate_at','application_verified_at','application_timing_status',
                  'application_verification','clear_patch_frames','acid_candidate_events',
                  'contact_closed_at','contact_close_reason','previous_acid_state','residue_warning','acid_search_stopped_at')
@@ -1623,7 +1715,7 @@ class ContinuousMonitor(threading.Thread):
                 record['candidate_mask_image']=self._picture(a['directory'],'unverified_mark_candidate',
                     self._stone_picture(picture,quad))
         contact_end=contact['rubbing_evidence_interval'][1]
-        record['rubbing_clip'] = self.journal.clip(start-1, max(a['returned'] or end, contact_end), a['directory']/'pickup_rubbing_return.avi')
+        record['rubbing_clip'] = self.journal.clip(a.get('evidence_start',start-1), max(a['returned'] or end, contact_end), a['directory']/'pickup_rubbing_return.avi')
         if onset is not None:
             reaction_end = min(onset+5, end, a['reaction_end'] if a['reaction_end'] is not None else float('inf'))
             record['acid_status'] = ('RECOVERED_FROM_CLIP' if a.get('acid_recovered') else

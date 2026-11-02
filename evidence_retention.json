@@ -10,5 +10,11 @@
   "cleanup_raw_after_archive": true,
   "require_server_ack": true,
   "ack_hmac_environment": "JEWELTRACKER_ACK_HMAC_KEY",
-  "archive_retention_days": 90
+  "archive_retention_days": 90,
+  "target_test_bytes": 2000000,
+  "archive_min_long_edge": 1280,
+  "archive_min_ssim": 0.95,
+  "retain_frame_catalogue": false,
+  "bank_min_retention_days": 0,
+  "original_min_retention_days": 0
 }

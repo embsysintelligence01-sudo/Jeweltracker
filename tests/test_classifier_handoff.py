@@ -78,7 +78,8 @@ class ClassifierHandoffTests(unittest.TestCase):
             self.assertTrue(m._acid_cancelled(old['id']))
             self.assertEqual(current['id'],w.continuous_contact_token)
             w._observe_stone_contact(scene(),time.time(),STONE,w.flow_revision,current['id'])
-            self.assertIsNone(w.rubber.ev)  # the first overlap cannot arm rubbing
+            self.assertIsNotNone(w.rubber.ev)  # first contact is retained without an overlap gate
+            self.assertFalse(w.rubber.rubbing)  # visibility alone is not rubbing confirmation
             w._observe_stone_contact(scene(),time.time(),STONE,w.flow_revision,current['id'])
             self.assertIsNotNone(w.rubber.ev)
             self.assertEqual(current['id'],w.rubber.ev['cycle_token'])

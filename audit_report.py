@@ -264,5 +264,8 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         for p in recording_problems:
             if y>H-90:footer();header('Recording Exceptions | Continued','Capture audit');y=135
             y=lines(28,y,f"{p['reason']}: {p['end']-p['start']:.2f} s, {p['count']} observations.",104)+10
+            if p.get('provisional_clip',{}):
+                link('Unverified pickup video (not a confirmed test)',p['provisional_clip'].get('path'),28,y)
+                y+=20
         footer()
     c.save()

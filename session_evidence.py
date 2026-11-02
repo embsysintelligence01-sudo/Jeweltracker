@@ -76,6 +76,9 @@ class FrameJournal:
     def pin_interval(self,token,start,end=None):
         with self.lock:self.pins[token]=(start,end)
 
+    def release_interval(self,token):
+        with self.lock:self.pins.pop(token,None)
+
     def finish_interval(self,token,end):
         with self.lock:
             if token in self.pins:self.pins[token]=(self.pins[token][0],end+.5)

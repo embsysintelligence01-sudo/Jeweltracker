@@ -18,12 +18,13 @@ class EvidenceRetentionTests(unittest.TestCase):
         for i in range(201):
             journal.offer(image,100+i*.1);journal.queue.join()
         journal.close()
-        rubbing=journal.clip(103,105,folder/'pickup_rubbing_return.avi')
-        acid=journal.clip(110,115,folder/'acid_2s_before_5s_after.avi')
+        rubbing=journal.clip(103,106,folder/'pickup_rubbing_return.avi')
+        acid=journal.clip(108,115,folder/'acid_2s_before_5s_after.avi')
         cv2.imwrite(str(root/'J1.jpg'),image)
         r=dict(jewel_id=1,cycle_id='test_1',started=104,returned=106,baseline_at=108,
-               acid_onset=112,finished=115,close_reason='SESSION_STOP',capture_complete=False,
-               issues=['Session ended during reaction.'],visibility=[],rubbing_status='UNCONFIRMED',
+               acid_onset=110,finished=115,close_reason='REACTION_COMPLETE',capture_complete=True,
+               reaction_coverage_status='COMPLETE',usable_reaction_seconds=5,
+               issues=[],visibility=[],rubbing_status='UNCONFIRMED',
                rubbing_clip=rubbing,acid_clip=acid,acid_candidate_clip=dict(acid),
                rub_source_frame='frames/103.000000.jpg',rub_image=str(root/'J1.jpg'),
                prediction=None,record_path=str(folder/'manifest.json'))
