@@ -1,0 +1,14 @@
+[Unit]
+Description=JewelTracker validated evidence retention cleanup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=embsys
+Group=embsys
+WorkingDirectory=/home/embsys/Desktop/jewel_tracker/jewel_tracker
+EnvironmentFile=-/etc/jeweltracker/evidence.env
+ExecStart=/home/embsys/Desktop/jewel_tracker/jewel_tracker/.venv-slic/bin/python evidence_archive.py captures/sessions --apply
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%

@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry acknowledged JewelTracker cleanup and expire retained archives
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

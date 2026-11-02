@@ -72,7 +72,8 @@ def event_rows(r):
     return rows
 
 
-def render_report(path,directory,jewels,tests,recording_problems,prediction_text):
+def render_report(path,directory,jewels,tests,recording_problems,prediction_text,asset_resolver=None):
+    resolve=asset_resolver or (lambda p:Path(p))
     c=canvas.Canvas(str(path),pagesize=A4)
     c.setTitle('JewelTracker | Continuous SOP Audit')
     c.setAuthor('EMBSYS / JEWELTRACKER')
@@ -129,8 +130,8 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
             footer();header(title+' | Continued','Per-jewel audit tables');y=130
         return y
     def picture(p,x,y,w,h,missing='Evidence not captured'):
-        if p and Path(p).is_file():
-            reader=ImageReader(str(p));iw,ih=reader.getSize();scale=min(w/iw,h/ih)
+        if p and resolve(p).is_file():
+            reader=ImageReader(str(resolve(p)));iw,ih=reader.getSize();scale=min(w/iw,h/ih)
             rw,rh=iw*scale,ih*scale
             c.drawImage(reader,x+(w-rw)/2,H-y-h+(h-rh)/2,width=rw,height=rh,mask='auto')
         else:
@@ -151,7 +152,7 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         lines(x+11,y+h-40,caption,width=int((w-20)/4.1),size=7,limit=3)
     def link(label,path,x,y):
         text(x,y,label,8,TEAL)
-        if path and Path(path).is_file():
+        if path and resolve(path).is_file():
             c.linkURL(Path(path).absolute().as_uri(),(x,H-y-3,x+170,H-y+10),relative=0,thickness=0)
     header('Gold Loan SOP | Session Audit','Actual session evidence | Material prediction and process verification are separate')
     completed=sum(bool(r.get('capture_complete')) for r in tests)

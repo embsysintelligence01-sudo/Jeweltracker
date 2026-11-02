@@ -309,7 +309,11 @@ class ContinuousMonitor(threading.Thread):
         super().__init__(name='continuous-tests', daemon=True)
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.journal = FrameJournal(self.directory)
+        from evidence_archive import RetentionPolicy,SessionGuard
+        self.retention_policy=RetentionPolicy.load()
+        self.session_guard=SessionGuard(self.directory)
+        self.journal = FrameJournal(self.directory,policy=self.retention_policy)
+        self.last_storage_notice=-1e9
         self.snapshot,self.models,self.acid_models,self._emit_callback=snapshot,models,acid_models,emit
         self.emit=self._emit_versioned
         self.cycle_versions={}
@@ -334,6 +338,7 @@ class ContinuousMonitor(threading.Thread):
         self.report_dirty=False
         self.final_lock=threading.Lock()
         self.final_pending=0
+        self.finalization_errors=[]
         self.deferred_dir=self.directory/"deferred_recovery"
         self.deferred_dir.mkdir(exist_ok=True)
 
@@ -401,8 +406,15 @@ class ContinuousMonitor(threading.Thread):
             self._close_intervals(self.last_ts)
             try:
                 self.report()
+                if self.retention_policy.enabled:
+                    from evidence_archive import ArchiveManager,durable_json
+                    if self.finalization_errors:raise OSError('A background finalizer failed: '+str(self.finalization_errors))
+                    durable_json(self.directory/'session_closed.json',dict(closed_at=time.time(),jobs_drained=True))
+                    result=ArchiveManager(self.directory,self.retention_policy).finalize(quiescent=True,session_guard=self.session_guard)
+                    self.emit('status',message='Evidence archive: '+result['status']+'.')
             except Exception as exc:
-                self.emit('status', message=f'PDF could not be written: {exc}. Recorded frames are saved.')
+                self.emit('status', message=f'Archive/report finalization failed; raw evidence retained: {exc}')
+            finally:self.session_guard.close()
 
     def stop(self):
         self.stop_event.set()
@@ -489,6 +501,7 @@ class ContinuousMonitor(threading.Thread):
             return_frame=None, version=snap['revision'], ph_status='Not observed in continuous capture',
             baseline_at=None, mask_decision_at=None, phase_events=[], acid_checks=[],
             stop_search=threading.Event(), recovery_cursor=None, last_recovery=-1e9)
+        self.journal.pin_interval(directory.name,ts-4)
         self.last_cycle_id=directory.name
         self.cycle_versions[directory.name]=snap['revision']
         self.active.update(placement=None if self.placement is None else self.placement.copy(),contact=None, contact_region=None, mask_evidence_status="NOT_ESTABLISHED",
@@ -1022,6 +1035,11 @@ class ContinuousMonitor(threading.Thread):
             return
         previous_ts=self.last_ts
         self.last_ts = ts
+        self.journal.processed_through(ts)
+        storage=self.journal.storage_status
+        if storage.get('low_disk') and ts-self.last_storage_notice>=30:
+            self.last_storage_notice=ts
+            self.emit('status',message=f"Storage low: {storage['free_bytes']/1024**3:.2f} GiB free. Required active evidence is retained.")
         if self.report_dirty:
             self.request_report()
         if self.revision != snap['revision']:
@@ -1281,6 +1299,7 @@ class ContinuousMonitor(threading.Thread):
             return
         self._close_contact(a,ts,'CYCLE_FINISHED')
         a['finished'] = ts
+        self.journal.finish_interval(a['id'],ts)
         a.pop('pending_acid',None)
         a['close_reason']=reason or ('REACTION_COMPLETE' if a['acid_onset'] is not None else 'SESSION_STOP')
         if reason=='NEXT_JEWEL_PICKUP':
@@ -1338,6 +1357,9 @@ class ContinuousMonitor(threading.Thread):
     def _finalize_one(self,a):
         try:
             self._recover_and_save(a)
+        except Exception as exc:
+            self.finalization_errors.append(str(exc))
+            raise
         finally:
             with self.final_lock:
                 self.final_pending-=1
@@ -1756,6 +1778,20 @@ class ContinuousMonitor(threading.Thread):
                 record['acid_detection_image'] = self._picture(a['directory'], 'acid_detected', detection)
             if verified_crop and baseline and transition and observation and self.classifier is not None and record['reaction_coverage_status']=='COMPLETE':
                 # Preserve the exact supported runtime output, even with process warnings.
+                if self.retention_policy.enabled:
+                    try:
+                        from acid_test.model_training.session_dataset import prepare_temporal_triplet
+                        triplet=prepare_temporal_triplet(baseline,transition,observation)
+                        record['classifier_input_images']={}
+                        for stage,image in zip(('baseline','application','reaction'),triplet):
+                            path=a['directory']/('classifier_input_'+stage+'.png')
+                            if not cv2.imwrite(str(path),cv2.cvtColor(image,cv2.COLOR_RGB2BGR)):
+                                raise OSError('Exact classifier input could not be saved')
+                            record['classifier_input_images'][stage]=str(path)
+                        record['classifier_input_origin']='exact_pre_normalization_rgb_summaries_from_live_arrays'
+                    except Exception as exc:
+                        record['classifier_input_archive_error']=str(exc)
+                        a['issues'].append('Exact classifier-input archive failed; raw evidence retained: '+str(exc))
                 record['prediction'] = self.classifier.predict(baseline, transition, observation)
             else:
                 a['issues'].append('Acid model not run: a complete usable reaction, baseline/application frames, or model were unavailable.')

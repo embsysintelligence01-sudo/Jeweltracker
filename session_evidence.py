@@ -7,6 +7,9 @@ from queue import Queue, Full
 import json
 import os
 import threading
+from contextlib import contextmanager
+import shutil
+import uuid
 import time
 
 import cv2
@@ -34,13 +37,20 @@ class FrameJournal:
     The original camera arrays are immutable. JPEG encoding and disk I/O happen
     only on the writer. Dropped samples and stream gaps remain explicit evidence.
     """
-    def __init__(self, directory, fps=15, queue_size=45):
+    def __init__(self, directory, fps=15, queue_size=45, policy=None):
         self.directory = Path(directory)
         self.frames_dir = self.directory / 'frames'
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.fps = fps
         self.queue = Queue(maxsize=queue_size)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.offer_lock = threading.Lock()
+        self.policy = policy
+        self.pins, self.leases = {}, {}
+        self.watermark = None
+        self.storage_status = {}
+        self.pruned_frames = 0
+        self._last_maintenance = -1e9
         self.entries, self.problems = [], []
         self.last_offered = -float('inf')
         self.last_received = None
@@ -49,18 +59,63 @@ class FrameJournal:
         self.thread.start()
 
     def offer(self, frame, timestamp):
-        if self.closed or timestamp <= self.last_offered:
-            return
-        if self.last_received is not None and timestamp-self.last_received > .5:
-            self.problem('camera_gap', self.last_received, timestamp)
-        self.last_received = timestamp
-        if timestamp-self.last_offered < 1/self.fps - .001:
-            return
-        self.last_offered = timestamp
-        try:
-            self.queue.put_nowait((timestamp, frame))
-        except Full:
-            self.problem('recording_queue_full', timestamp, timestamp)
+        # Constant-time producer path; all disk/retention work is on the writer.
+        with self.offer_lock:
+            if self.closed or timestamp <= self.last_offered:return
+            if self.last_received is not None and timestamp-self.last_received > .5:
+                self.problem('camera_gap', self.last_received, timestamp)
+            self.last_received = timestamp
+            if timestamp-self.last_offered < 1/self.fps - .001:return
+            self.last_offered = timestamp
+            try:self.queue.put_nowait((timestamp, frame))
+            except Full:self.problem('recording_queue_full', timestamp, timestamp)
+
+    def processed_through(self,timestamp):
+        with self.lock:self.watermark=timestamp
+
+    def pin_interval(self,token,start,end=None):
+        with self.lock:self.pins[token]=(start,end)
+
+    def finish_interval(self,token,end):
+        with self.lock:
+            if token in self.pins:self.pins[token]=(self.pins[token][0],end+.5)
+
+    @contextmanager
+    def lease(self,start,end):
+        token=uuid.uuid4().hex
+        with self.lock:self.leases[token]=(start,end)
+        try:yield
+        finally:
+            with self.lock:self.leases.pop(token,None)
+
+    def _maintenance(self,timestamp):
+        if self.policy is None or not self.policy.enabled or timestamp-self._last_maintenance<1:return
+        self._last_maintenance=timestamp
+        free=shutil.disk_usage(self.directory).free
+        self.storage_status=dict(free_bytes=free,low_disk=free<self.policy.disk_warning_free_gib*1024**3,
+                                 pruned_idle_frames=self.pruned_frames)
+        cutoff=timestamp-self.policy.idle_buffer_seconds
+        with self.lock:
+            if self.watermark is not None:cutoff=min(cutoff,self.watermark-self.policy.pre_roll_seconds)
+            protected=list(self.pins.values())+list(self.leases.values())
+            keep=[]
+            for entry in self.entries:
+                ts=entry['timestamp']
+                if ts>=cutoff or any(lo<=ts and (hi is None or ts<=hi) for lo,hi in protected):
+                    keep.append(entry);continue
+                path=self.directory/entry['file']
+                if path.is_symlink():raise OSError('Refusing to prune symlink frame')
+                path.unlink(missing_ok=True);self.pruned_frames+=1
+            changed=len(keep)!=len(self.entries)
+            self.entries=keep
+            if not changed:return False
+            # The temporary catalogue is compacted with the buffer; it cannot
+            # grow for days while idle. Active interval entries remain intact.
+            temp=self.directory/'frames.pruning.tmp'
+            with temp.open('w') as handle:
+                for entry in keep:handle.write(json.dumps(entry)+'\n')
+            os.replace(temp,self.directory/'frames.jsonl')
+            return True
 
     def problem(self, reason, start, end):
         with self.lock:
@@ -71,26 +126,27 @@ class FrameJournal:
                 self.problems.append(dict(reason=reason, start=start, end=end, count=1))
 
     def _write(self):
-        with (self.directory/'frames.jsonl').open('a', encoding='utf-8') as index:
+        index=(self.directory/'frames.jsonl').open('a',encoding='utf-8')
+        try:
             while True:
                 item = self.queue.get()
                 try:
-                    if item is None:
-                        return
+                    if item is None:return
                     timestamp, frame = item
                     name = f'{timestamp:.6f}.jpg'
                     path = self.frames_dir/name
                     if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
                         raise OSError('JPEG evidence write failed')
                     entry = dict(timestamp=timestamp, file=f'frames/{name}', shape=list(frame.shape))
-                    with self.lock:
-                        self.entries.append(entry)
-                    index.write(json.dumps(entry)+'\n')
-                    index.flush()
+                    with self.lock:self.entries.append(entry)
+                    index.write(json.dumps(entry)+'\n');index.flush()
+                    if self._maintenance(timestamp):
+                        index.close()
+                        index=(self.directory/'frames.jsonl').open('a',encoding='utf-8')
                 except Exception as exc:
                     self.problem(f'recording_error: {exc}', item[0], item[0])
-                finally:
-                    self.queue.task_done()
+                finally:self.queue.task_done()
+        finally:index.close()
 
     def between(self, start, end, fps=None):
         with self.lock:
@@ -105,7 +161,7 @@ class FrameJournal:
         return selected
 
     def read(self, entry):
-        frame = cv2.imread(str(self.directory/entry['file']))
+        with self.lock:frame = cv2.imread(str(self.directory/entry['file']))
         if frame is None:
             raise OSError(f"Recorded frame unavailable: {entry['file']}")
         return frame
@@ -119,7 +175,10 @@ class FrameJournal:
                 return
             time.sleep(.01)
 
-    def clip(self, start, end, output):
+    def clip(self,start,end,output):
+        with self.lease(start,end):return self._clip(start,end,output)
+
+    def _clip(self, start, end, output):
         """The timestamp sidecar is authoritative for irregular/dropped samples."""
         entries = self.between(start, end)
         output = Path(output)
@@ -140,7 +199,7 @@ class FrameJournal:
             for entry in entries:
                 image = self.read(entry)
                 if image.shape != first.shape:
-                    continue
+                    raise OSError('Evidence frame dimensions changed; clip incomplete')
                 writer.write(image)
                 written.append(entry['timestamp'])
         finally:
@@ -154,14 +213,25 @@ class FrameJournal:
         return result
 
     def close(self):
-        if not self.closed:
-            self.closed = True
-            self.queue.put(None)
+        with self.offer_lock:
+            send_stop=not self.closed
+            self.closed=True
+        if send_stop:self.queue.put(None)
         self.thread.join()
 
 
 def write_report(directory, jewels, tests, recording_problems=()):
     """Only actual tracker outputs: IDs, pictures, tracking, rub/mask and acid."""
+    from evidence_archive import report_guard
+    with report_guard(directory):
+        if (Path(directory)/'archive_commit.json').is_file():
+            from evidence_archive import ArchiveManager
+            ArchiveManager(directory).validate_commit()
+            return str(Path(directory)/'report.pdf')
+        return _write_report(directory,jewels,tests,recording_problems)
+
+
+def _write_report(directory,jewels,tests,recording_problems=()):
     from audit_report import render_report
     directory=Path(directory)
     manifest=dict(schema='jewel_continuous_session_v1',generated=datetime.now().isoformat(),

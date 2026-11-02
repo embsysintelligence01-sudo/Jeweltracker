@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "idle_buffer_seconds": 20,
+  "pre_roll_seconds": 5,
+  "disk_warning_free_gib": 3,
+  "archive_codec": "h264",
+  "h264_crf": 18,
+  "h264_preset": "veryfast",
+  "encoder_threads": 1,
+  "cleanup_raw_after_archive": true,
+  "require_server_ack": true,
+  "ack_hmac_environment": "JEWELTRACKER_ACK_HMAC_KEY",
+  "archive_retention_days": 90
+}
