@@ -1,4 +1,89 @@
-# Production recording retention
+# Simple session output (current workstation policy)
+
+Each completed test is now compressed **while the camera keeps running**. The
+session `report.pdf` is an index linking to `J1/<cycle>/report.pdf`, `rubbing.avi`
+and `acid.avi` (similarly for J2, etc.). Each jewel PDF embeds its full evidence
+pictures before source images are deleted. PDF links are relative, so moving the
+whole session folder preserves them. Only one encoder runs at a time, outside
+camera/inference/recovery threads, with one CPU thread and low scheduling priority.
+
+After publication and verification, the completed test's source folder is deleted
+and its raw-frame pin is released. The recorder removes unneeded frames, while
+protecting overlapping active tests and reader leases. Idle footage has a five-second
+rolling buffer, and only two latest before-stone/frame reference pairs remain.
+An open session still needs that bounded camera buffer, thumbnails, session metadata
+and small maintenance records; its total size can exceed the finished jewel files.
+Normal shutdown removes that remaining working data. Two empty hidden lock files
+remain to coordinate report/recording access.
+
+`evidence_retention.json` explicitly enables `simple_output: true`, local cleanup
+(`require_server_ack: false`) and a **3,000,000 byte limit per jewel**, including
+its proportional share of the common PDF and all attempts for that jewel.
+Videos use two-pass H.264 in an AVI container, up to 1280 pixels on the long edge and 10 FPS, with
+bitrate allocated by clip duration. The full frame and complete clip duration
+are preserved. Compression reduces image quality; this mode prioritizes the
+requested storage limit rather than the legacy archive's SSIM threshold.
+
+Cleanup starts after each test's model result, evidence exports and jewel report
+are ready; no Stop click is needed. Failed encoding, missing clips, insufficient
+size budget, or unassigned evidence retain originals. The dedicated Storage label
+shows compression, success or retry status independently of live test instructions.
+Progress, attempts, current clip, retry time and error text persist in
+`.live-retention/<cycle>.json`. Failed jobs retry after 10 seconds with increasing
+delay capped at five minutes. On the next app launch, pending jobs in previous
+sessions resume; recording locks protect any session still in use. Verified
+published files are reused if deletion was interrupted. Previous shutdown-only
+`.simple-staging` attempts are also retried when their session is closed.
+Failed shutdown maintenance records its error in `storage_error.json`.
+No server upload is needed.
+
+The earlier shutdown-only layout remains supported for historical sessions.
+To simplify one such already closed session explicitly:
+
+```bash
+.venv-slic/bin/python simple_session.py captures/sessions/SESSION_ID --execute
+```
+
+The earlier session `20261110_121011_b70217b7` was reduced from 392,304,167 to
+5,544,489 bytes. J1 uses 2,778,300 bytes and J2 uses 2,766,190 bytes including
+their equal shares of the 513,359-byte PDF (shares round up by one byte).
+All four 1280x720 clips fully decoded and the PDF's eight clip links point to
+the relative final paths.
+Restart the app to use the new policy.
+
+The interrupted session `20261110_124727_3aa3f762` was also recovered using the
+per-jewel workflow: **327,386,086 → 5,331,809 bytes**. J1 uses 2,656,484 bytes
+and J2 uses 2,675,326 bytes including their shares of the session index. Both
+jewel PDFs retain their evidence images, and all index/report clip links target
+the final AVI files. Other historical sessions are untouched.
+
+Its original compact MP4s were remuxed into AVI without re-encoding: every decoded
+frame matched byte-for-byte, and frame rates/durations were checked before removing
+the MP4s. AVI container overhead added 24,159 bytes across all four clips.
+To convert another already simplified MP4 session, use the command above with
+`--convert-mp4-to-avi`.
+
+AVI still needs an H.264 decoder. On this Ubuntu account the missing GStreamer
+decoder and its Ubuntu package dependencies were extracted under
+`~/.local/share/jeweltracker/ubuntu-codecs/`. A user-level Videos desktop entry
+loads those libraries; no system packages were changed. All four AVI clips passed
+GStreamer `decodebin` playback to a test sink. Reversion instructions and package
+license notices are in that local codec directory. Other Ubuntu installations can
+provide the decoder with `sudo apt install gstreamer1.0-libav`.
+
+PDF playback uses the standard `org.gnome.Totem` desktop D-Bus activation with a
+user service at `~/.local/share/dbus-1/services/org.gnome.Totem.service` that loads
+the local codecs. Directly starting the wrapper from Evince inherited its
+`sanitized_helper` confinement and could not load user-owned decoder libraries.
+Desktop service activation starts Videos through the session bus, as a normal
+desktop application. AppArmor rules remain unchanged. The integration can be
+reapplied with `python3 deploy/configure_pdf_video_player.py`.
+
+## Legacy archive mode
+
+The documentation below describes the earlier archive workflow. It remains
+available by disabling `simple_output` and selecting the appropriate policy;
+its acknowledgment and quality requirements do not apply to simple output.
 
 The active recorder still writes original-size JPEGs at quality 95 with the existing 15 FPS target and 45-frame nonblocking queue. Tracking, mask verification, acid decisions, model sessions and live inference scheduling are unchanged. Storage maintenance runs on the evidence writer; archive encoding is exclusively post-session, one low-priority encoder thread by default.
 

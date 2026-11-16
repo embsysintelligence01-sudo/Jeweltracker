@@ -198,7 +198,7 @@ class AcidMaskTests(unittest.TestCase):
     def test_spreading_acid_still_requires_confidence_and_stone_location(self):
         mask = np.zeros((100,160), np.uint8)
         mask[30:50,40:60] = 255
-        for stone, confidence in (((0,0,160,100), .59), ((30,20,80,70), .95)):
+        for stone, confidence in (((0,0,160,100), .29), ((30,20,80,70), .95)):
             with self.subTest(stone=stone, confidence=confidence):
                 seq = self.sequence(mask)
                 seq.stone = stone

@@ -76,7 +76,7 @@ class AcidSequence:
         for det in detections:
             x1, y1, x2, y2 = det.bbox
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            if det.confidence >= 0.60 and sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
+            if det.confidence >= 0.30 and sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
                 if self.streak_mask is not None:
                     h, w = self.streak_mask.shape
                     ix1, iy1 = int(np.clip(x1, 0, w)), int(np.clip(y1, 0, h))
@@ -89,7 +89,7 @@ class AcidSequence:
                 elif not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
                     continue
                 valid.append(det)
-            elif self.streak_mask is not None and det.confidence >= .60:
+            elif self.streak_mask is not None and det.confidence >= .30:
                 self.rejection_reason = 'Acid outside the saved new-rub ROI. Apply acid over the magenta mark.'
         best = max(valid, key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]) * d.confidence, default=None)
         if best is None:

@@ -146,8 +146,11 @@ class CycleLifecycleTests(unittest.TestCase):
             a=m.active
             a['returned']=100.1;a['return_frame']=scene()
             a['poses']=[(100+i*.1,QUAD.copy()) for i in range(65)]
-            for i in range(65):m.journal.offer(scene(acid=i>=10),100+i*.1)
-            m.journal.queue.join()
+            # This checks exact source pixels, so supply a complete recording
+            # rather than flooding the bounded camera queue faster than real time.
+            for i in range(65):
+                m.journal.offer(scene(acid=i>=10),100+i*.1)
+                m.journal.queue.join()
             source=scene(acid=True);source[80:90,100:110]=(11,99,221)
             captured={};original=m._picture
             def picture(directory,name,frame):

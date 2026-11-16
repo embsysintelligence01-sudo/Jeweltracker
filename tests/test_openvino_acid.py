@@ -1,38 +1,37 @@
 from pathlib import Path
 import unittest
-from unittest.mock import patch,Mock
 import numpy as np
 
 from acid_test.openvino_detector import OpenVINOAcidDetector
-DETECTOR_PATH=Path(__file__).resolve().parents[1]/'int_8_acid_model/acidph_int8.xml'
+from acid_test.onnx_detector import OnnxAcidDetector
+from acid_test.runtime import DETECTOR_PATH
 
 
 class OpenVINOAcidTests(unittest.TestCase):
-    def test_rotated_detector_output_is_adapted_without_coordinate_offsets(self):
-        backend=Mock(height=640,width=640,names={0:'acidph'})
-        backend.detect.return_value=[dict(bbox=(101,205,144,299),score=.91)]
-        with patch('acid_test.openvino_detector.OpenVINOOBB',return_value=backend):
-            detector=OpenVINOAcidDetector(DETECTOR_PATH)
-            frame=np.zeros((400,600,3),np.uint8)
-            found,elapsed=detector.predict(frame,.6)
-        self.assertEqual((101,205,144,299),found[0].bbox)
-        self.assertEqual(.91,found[0].confidence)
-        self.assertGreaterEqual(elapsed,0)
-        self.assertIs(frame,backend.detect.call_args.args[0])
-        self.assertEqual(dict(class_id=0,confidence=.6),backend.detect.call_args.kwargs)
-        self.assertTrue(detector.quantized)
-        self.assertEqual(64,len(detector.model_sha256))
+    def test_class_filter_and_camera_coordinates(self):
+        raw = np.zeros((1, 38, 3), np.float32)
+        # Acid, stronger rubbed-mask class, and low-confidence acid.
+        raw[0, :6, :] = np.array([[104, 200, 300], [156, 156, 156],
+                                 [52, 52, 52], [52, 52, 52],
+                                 [.7, .8, .2], [.1, .9, .1]])
+        found = OpenVINOAcidDetector.postprocess(raw, (400, 800, 3), .52, 0, 104, .30)
+        self.assertEqual(1, len(found))
+        self.assertEqual((150, 50, 250, 150), found[0].bbox)
+        self.assertAlmostEqual(.7, found[0].confidence)
 
-    def test_actual_int8_session_runs_and_reuses_the_compiled_cpu_model(self):
-        detector=OpenVINOAcidDetector(DETECTOR_PATH)
-        model=detector.model.compiled
+    def test_active_onnx_session_runs_and_reuses_cpu_model(self):
+        self.assertEqual('acid_detector.onnx', DETECTOR_PATH.name)
+        detector = OnnxAcidDetector(DETECTOR_PATH)
+        session = detector.session
         for _ in range(2):
-            found,elapsed=detector.predict(np.zeros((360,640,3),np.uint8),.6)
-            self.assertEqual([],found)
-            self.assertGreaterEqual(elapsed,0)
-        self.assertIs(model,detector.model.compiled)
-        self.assertTrue(detector.quantized)
-        self.assertTrue(any('CPU' in x for x in model.get_property('EXECUTION_DEVICES')))
+            found, elapsed = detector.predict(np.zeros((360, 640, 3), np.uint8), .30)
+            self.assertEqual([], found)
+            self.assertGreaterEqual(elapsed, 0)
+        self.assertIs(session, detector.session)
+        self.assertEqual({0: 'acid'}, detector.names)
+        self.assertEqual(64, len(detector.model_sha256))
+        self.assertEqual(['CPUExecutionProvider'], session.get_providers())
 
 
-if __name__=='__main__':unittest.main()
+if __name__ == '__main__':
+    unittest.main()

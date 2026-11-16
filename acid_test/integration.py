@@ -57,11 +57,18 @@ class AcidModelCache:
                 # Synthetic warm-up only. Live inference runs during a
                 # confirmed rubbed jewel's test and its cleanup handoff.
                 blank = np.zeros((320, 320, 3), dtype=np.uint8)
-                detector.predict(blank, 0.60)
+                detector.predict(blank, 0.30)
                 classifier.predict([blank], [blank], [blank])
-                self.detector_sha256 = _sha256(DETECTOR_PATH)
+                self.detector_sha256 = detector.model_sha256
                 self._models = detector, classifier
             return self._models
+
+
+    def close(self):
+        """Release cached runtimes after every testing consumer has stopped."""
+        with self._lock:
+            self._models = self._ph_model = None
+            self.detector_sha256 = None
 
 
 def acid_crop(seq):
@@ -304,7 +311,7 @@ class AcidTestThread(QtCore.QThread):
                         now = time.monotonic()
                         future = None
                     if seq.state == 'WAIT_FOR_ACID' and future is None and now - last_detection >= 0.2:
-                        future = pool.submit(detector.predict, frame.copy(), 0.60)
+                        future = pool.submit(detector.predict, frame.copy(), 0.30)
                         last_detection = now
                     if seq.state != 'PROCESSING' and (seq.state != last_phase or now - last_progress >= 0.1):
                         self.progress.emit(self.payload(phase=seq.state, message=seq.instruction(now)))

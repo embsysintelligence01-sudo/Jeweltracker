@@ -280,7 +280,8 @@ under `acid_test/`.
 
 The integrated acid-on-stone detector currently uses
 `acid_test/models/acid_detector.onnx` (ONNX Runtime CPU). The experimental
-`int_8_acid_model/` export is retained but is not loaded by the application.
+INT8 export is archived at `../backups/disabled_acid_int8_20261102/int_8_acid_model/`
+and is not loaded by the application.
 
 Automatic stone checks run continuously on the newest available camera frame.
 There is no fixed 0.5-second interval and no queue of old frames. A 5 ms idle

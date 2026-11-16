@@ -57,6 +57,16 @@ class ClassifierHandoffTests(unittest.TestCase):
             self.assertTrue(all(abs(int(frame[y,x,0])-85)<8 for frame in baseline))
             self.assertTrue(any(abs(int(frame[y,x,0])-120)<8 for frame in pouring))
             self.assertEqual('gold_22k',record['prediction']['prediction'])
+            export=record['temporal_training_capture']
+            import cv2
+            for phase,images in zip(('baseline','transition','observation'),(baseline,pouring,reaction)):
+                entries=export[phase+'_frames']
+                self.assertEqual(len(images),len(entries))
+                for entry,image in zip(entries,images):
+                    self.assertTrue(np.array_equal(image,cv2.imread(str(a['directory']/entry['path']))))
+                if phase!='baseline':
+                    offsets=[entry['offset_seconds'] for entry in entries]
+                    self.assertEqual(sorted(offsets),offsets)
 
     def test_next_pickup_during_reaction_reopens_live_segmentation_for_j2(self):
         with monitor_case(inactivity_seconds=60) as (m,events):
@@ -78,8 +88,7 @@ class ClassifierHandoffTests(unittest.TestCase):
             self.assertTrue(m._acid_cancelled(old['id']))
             self.assertEqual(current['id'],w.continuous_contact_token)
             w._observe_stone_contact(scene(),time.time(),STONE,w.flow_revision,current['id'])
-            self.assertIsNotNone(w.rubber.ev)  # first contact is retained without an overlap gate
-            self.assertFalse(w.rubber.rubbing)  # visibility alone is not rubbing confirmation
+            self.assertIsNone(w.rubber.ev)  # the first overlap cannot arm rubbing
             w._observe_stone_contact(scene(),time.time(),STONE,w.flow_revision,current['id'])
             self.assertIsNotNone(w.rubber.ev)
             self.assertEqual(current['id'],w.rubber.ev['cycle_token'])

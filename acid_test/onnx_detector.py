@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,12 @@ class OnnxAcidDetector:
             raise RuntimeError("Acid detector requires the single-class YOLOv8-seg output contract")
         self.input_name = inputs[0].name
         self.output_name = outputs[0].name
+        digest = hashlib.sha256()
+        with self.path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        self.model_sha256 = digest.hexdigest()
+        self.names = {0: "acid"}
 
     @staticmethod
     def preprocess(frame: np.ndarray) -> tuple[np.ndarray, float, int, int]:

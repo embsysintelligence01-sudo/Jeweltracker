@@ -1,5 +1,6 @@
 """Visual audit PDF. All evidence and outcomes come from the saved manifest."""
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import textwrap
 from xml.sax.saxutils import escape
@@ -12,7 +13,9 @@ from reportlab.lib.pagesizes import A4
 
 NAVY=HexColor('#0c1c2b');TEAL=HexColor('#008b8b');INK=HexColor('#243546')
 PALE=HexColor('#f3f6f9');BORDER=HexColor('#d9e2ea');AMBER=HexColor('#a7600a')
+GREEN=HexColor('#16803c')
 W,H=A4
+REPORT_TIMEZONE=ZoneInfo('Asia/Kolkata')
 
 
 def audit_outcome(r):
@@ -26,7 +29,16 @@ def audit_outcome(r):
 
 
 def when(value):
-    return datetime.fromtimestamp(value).strftime('%H:%M:%S.%f')[:-3] if value is not None else 'Not captured'
+    return datetime.fromtimestamp(value,REPORT_TIMEZONE).strftime('%H:%M:%S.%f')[:-3] if value is not None else 'Not captured'
+
+
+def session_period(tests):
+    starts=[r['started'] for r in tests if r.get('started') is not None]
+    ends=[r['finished'] for r in tests if r.get('finished') is not None]
+    def stamp(value):
+        return datetime.fromtimestamp(value,REPORT_TIMEZONE).strftime('%d %b %Y %H:%M:%S')
+    return ('All jewels | Start: '+(stamp(min(starts)) if starts else 'Not captured')
+            +' | End: '+(stamp(max(ends)) if ends else 'Not captured')+' | IST')
 
 
 def event_rows(r):
@@ -72,8 +84,9 @@ def event_rows(r):
     return rows
 
 
-def render_report(path,directory,jewels,tests,recording_problems,prediction_text,asset_resolver=None):
-    resolve=asset_resolver or (lambda p:Path(p))
+def render_report(path,directory,jewels,tests,recording_problems,prediction_text,asset_resolver=None,simple_output=False):
+    directory=Path(directory).resolve()
+    resolve=asset_resolver or (lambda p:Path(p) if Path(p).is_absolute() else directory/Path(p))
     c=canvas.Canvas(str(path),pagesize=A4)
     c.setTitle('JewelTracker | Continuous SOP Audit')
     c.setAuthor('EMBSYS / JEWELTRACKER')
@@ -95,6 +108,7 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         text(28,25,'EMBSYS / JEWELTRACKER',9,white,True)
         text(28,57,title,21,white,True)
         text(28,80,subtitle,9,white)
+        text(28,95,session_period(tests),7,white)
         c.setFillColor(TEAL);c.rect(0,H-106,W,3,fill=1,stroke=0)
     def footer():
         text(28,H-20,'Session '+directory.name,7)
@@ -137,53 +151,72 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         else:
             c.setFillColor(PALE);c.rect(x,H-y-h,w,h,fill=1,stroke=0)
             lines(x+9,y+h/2,missing,width=max(20,int(w/4.5)),size=9,limit=4)
-    def card(x,y,w,title,value,detail):
-        box(x,y,w,68)
-        text(x+10,y+16,title.upper(),8)
-        text(x+10,y+35,value,10,TEAL if value in ('VERIFIED','FRESH / ON MARK') else AMBER,True)
-        lines(x+10,y+49,detail,width=int(w/4.1),size=7,limit=2)
-    def panel(x,y,w,h,title,p,caption,second=None):
+    def panel(x,y,w,h,title,p,caption,second=None,status=None,verified=False):
         box(x,y,w,h)
         text(x+11,y+20,title,11,INK,True)
+        image_top=34
+        if status is not None:
+            text(x+11,y+39,status,10,GREEN if verified else AMBER,True)
+            image_top=50
         if second:
-            picture(p,x+10,y+34,(w-25)/2,h-86)
-            picture(second,x+15+(w-25)/2,y+34,(w-25)/2,h-86)
-        else:picture(p,x+10,y+34,w-20,h-86)
+            picture(p,x+10,y+image_top,(w-25)/2,h-image_top-52)
+            picture(second,x+15+(w-25)/2,y+image_top,(w-25)/2,h-image_top-52)
+        else:picture(p,x+10,y+image_top,w-20,h-image_top-52)
         lines(x+11,y+h-40,caption,width=int((w-20)/4.1),size=7,limit=3)
-    def link(label,path,x,y):
+    def link(label,path,x,y,width=170):
         text(x,y,label,8,TEAL)
         if path and resolve(path).is_file():
-            c.linkURL(Path(path).absolute().as_uri(),(x,H-y-3,x+170,H-y+10),relative=0,thickness=0)
+            target=Path(path) if Path(path).is_absolute() else directory/Path(path)
+            if simple_output:
+                from urllib.parse import quote
+                url=quote(target.relative_to(directory).as_posix())
+            else:url=target.absolute().as_uri()
+            c.linkURL(url,(x,H-y-3,x+width,H-y+10),relative=0,thickness=0)
+    def clip_button(label,clip,x,y):
+        path=(clip or {}).get('path')
+        available=bool(path and resolve(path).is_file())
+        box(x,y,120,25,white)
+        if available:
+            link('Open '+label+' clip',path,x+8,y+16,width=104)
+        else:
+            text(x+8,y+16,label+' unavailable',7,AMBER)
     header('Gold Loan SOP | Session Audit','Actual session evidence | Material prediction and process verification are separate')
     completed=sum(bool(r.get('capture_complete')) for r in tests)
-    verified=sum(audit_outcome(r)=='EVIDENCE VERIFIED' for r in tests)
-    for i,(label,value) in enumerate([('JEWELS',len(jewels)),('TEST CYCLES',len(tests)),('ACID CAPTURES',completed),('VERIFIED SOP',verified)]):
-        x=28+i*137;box(x,124,128,61,PALE);text(x+10,143,label,8);text(x+10,171,value,22,TEAL,True)
+    summary=[('JEWELS',len(jewels)),('TEST CYCLES',len(tests)),('ACID CAPTURES',completed)]
+    card_width=(W-56-20)/3
+    for i,(label,value) in enumerate(summary):
+        x=28+i*(card_width+10);box(x,124,card_width,61,PALE);text(x+10,143,label,8);text(x+10,171,value,22,TEAL,True)
     by_id={j['id']:j for j in jewels}
     text(28,212,'TEST-LEVEL OUTCOMES',10,INK,True)
     y=232
     for r in tests:
-        if y>H-110:
+        if y>H-150:
             footer();header('Session Audit | Continued','Test-level outcomes');y=132
         jid=f"J{r['jewel_id']}" if r.get('jewel_id') is not None else 'Unassigned'
-        box(28,y,W-56,61,PALE)
+        box(28,y,W-56,100,PALE)
         text(40,y+19,jid,12,TEAL,True)
         picture(by_id.get(r.get('jewel_id'),{}).get('image'),76,y+7,48,47,'No photo')
         text(135,y+19,audit_outcome(r),10,INK,True)
-        text(135,y+36,'Acid model: '+prediction_text(r.get('prediction')),9)
-        lines(135,y+49,'Contact: '+r.get('rubbing_contact_status','Not observed')+' | Mask: '+r.get('mask_evidence_status','Not established'),width=83,size=7,limit=1)
-        y+=71
-    if not tests:lines(28,y,'No jewellery test cycle was established. Session frames and tracked jewel visibility are preserved.',90)
+        lines(135,y+36,'Acid model: '+prediction_text(r.get('prediction')),width=53,size=8,limit=2)
+        lines(135,y+62,'Contact: '+r.get('rubbing_contact_status','Not observed')+' | Mask: '+r.get('mask_evidence_status','Not established'),width=60,size=7,limit=2)
+        text(40,y+90,'Start: '+when(r.get('started'))+' | End: '+when(r.get('finished'))+' IST',8)
+        clip_button('rubbing',r.get('rubbing_clip'),W-160,y+13)
+        clip_button('acid',r.get('acid_clip'),W-160,y+48)
+        if r.get('compact_report'):
+            link('Open full jewel report',r['compact_report'],135,y+79,width=145)
+        y+=110
+    if not tests:lines(28,y,'No jewellery test cycle was established.' if simple_output else 'No jewellery test cycle was established. Session frames and tracked jewel visibility are preserved.',90)
     y=max(y+15,580)
     if y>H-100:
         footer();header('Session Audit | Evidence legend','Read predictions and evidence quality independently');y=138
     lines(28,y,'Gold: jewellery contact mask. Magenta: rubbed-mark detection rectangle (read verification status). Reaction images contain original camera pixels.',100,size=9)
     lines(28,y+48,'Unverified, rejected and missing evidence never becomes a confirmed SOP pass. Model output is a prediction; it is not physical ground truth.',100,size=9)
-    link('Open session manifest',directory/'session.json',28,H-45)
+    if not simple_output:link('Open session manifest',directory/'session.json',28,H-45)
     footer()
     for r in tests:
+        if r.get('compact_report'):continue  # Full evidence is embedded in its immutable jewel PDF.
         jid=f"J{r['jewel_id']}" if r.get('jewel_id') is not None else 'Unassigned jewel'
-        header(jid+' | Rubbing and Acid Evidence','Timestamped source frames | '+audit_outcome(r))
+        header(jid+' | Rubbing and Acid Evidence','Start: '+when(r.get('started'))+' | End: '+when(r.get('finished'))+' IST | '+audit_outcome(r))
         picture(by_id.get(r.get('jewel_id'),{}).get('image'),28,118,65,66,'No original image')
         text(105,133,'ORIGINAL JEWELLERY / CYCLE',8)
         text(105,151,jid+' | '+str(r.get('cycle_id','legacy record')),10,INK,True)
@@ -191,17 +224,19 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         verified_contact=r.get('rubbing_verified',False)
         target=r.get('acid_target_status')
         acid=('OVERLAPPING' if target=='ACID_OVERLAPS_NEW_RUB' else 'PARTIAL OVERLAP' if target=='ACID_PARTIALLY_OVERLAPS_NEW_RUB' else 'DIFFERENT LOCATION' if target=='ACID_AT_DIFFERENT_LOCATION' else 'COMPARISON UNAVAILABLE' if r.get('acid_onset') is not None else 'NOT CONFIRMED')
-        card(28,196,174,'Rubbing contact','VERIFIED' if verified_contact else 'UNVERIFIED',r.get('rubbing_contact_status','Not observed'))
-        card(211,196,174,'New rubbed-mark detection','VERIFIED' if r.get('mask_evidence_status')=='VERIFIED' else 'NOT VERIFIED',r.get('mask_evidence_status','Not established'))
-        card(394,196,174,'Acid placement',acid,r.get('acid_status','Not detected'))
         contact_caption=when(r.get('rub_timestamp'))+' | '+r.get('rubbing_contact_reason','Contact unavailable')
         mask_caption=when(r.get('mask_timestamp',r.get('candidate_mask_timestamp',r.get('mask_completed_at'))))+' | '+r.get('mask_reason','New mask unavailable')
-        panel(28,279,264,195,'01 / Rubbing contact',r.get('rub_image'),contact_caption)
-        panel(304,279,264,195,'02 / New rubbed-mark detection',r.get('mask_image') or r.get('candidate_mask_image'),mask_caption)
+        panel(28,196,264,235,'01 / Rubbing contact',r.get('rub_image'),contact_caption,
+              status='VERIFIED' if verified_contact else 'UNVERIFIED',verified=verified_contact)
+        verified_mask=r.get('mask_evidence_status')=='VERIFIED'
+        panel(304,196,264,235,'02 / New rubbed-mark detection',r.get('mask_image') or r.get('candidate_mask_image'),mask_caption,
+              status='VERIFIED' if verified_mask else 'NOT VERIFIED',verified=verified_mask)
         acid_caption=when(r.get('acid_placement_timestamp',r.get('acid_onset')))+' | '+(target or 'Fresh application not established')
-        panel(28,487,264,195,'03 / Acid placement',r.get('acid_rub_comparison_image') or r.get('acid_detection_image'),acid_caption)
+        verified_acid=target=='ACID_OVERLAPS_NEW_RUB'
+        panel(28,444,264,238,'03 / Acid placement',r.get('acid_rub_comparison_image') or r.get('acid_detection_image'),acid_caption,
+              status='VERIFIED - OVERLAPPING' if verified_acid else acid,verified=verified_acid)
         reaction_caption=when(r.get('reaction_first_timestamp'))+' / '+when(r.get('reaction_last_timestamp'))+' | '+str(round(r.get('usable_reaction_seconds',0),2))+' s usable of 5.0 s requested'
-        panel(304,487,264,195,'04 / Reaction observation',r.get('reaction_first_image') or r.get('acid_image'),reaction_caption,second=r.get('acid_image'))
+        panel(304,444,264,238,'04 / Reaction observation',r.get('reaction_first_image') or r.get('acid_image'),reaction_caption,second=r.get('acid_image'))
         missed=sum(max(0,v['end']-v['start']) for v in r.get('visibility',[]) if v.get('jewel_id')==r.get('jewel_id') and v['status']=='MISSED')
         box(28,696,540,103,PALE)
         text(39,713,'AUDIT OUTCOME: '+audit_outcome(r),10,INK,True)
@@ -209,10 +244,11 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         text(39,745,f'Tracking missed: {missed:.2f} s | Close reason: '+str(r.get('close_reason','Not recorded')),8)
         reason=(r.get('prediction') or {}).get('invalid_reason') or '; '.join(r.get('issues',[])) or r.get('rubbing_contact_reason','')
         lines(39,760,reason,width=113,size=7,limit=2)
-        link('Original clips / exact evidence in appendix',r.get('record_path'),39,790)
+        if not simple_output:link('Original clips / exact evidence in appendix',r.get('record_path'),39,790)
         footer()
     # Full reasons/timestamps are never silently truncated to fit a visual card.
     for r in tests:
+        if r.get('compact_report'):continue
         jid=f"J{r['jewel_id']}" if r.get('jewel_id') is not None else 'Unassigned'
         header(jid+' | Audit Details','Exact timestamps, visibility intervals, confidence and failure reasons')
         y=130
@@ -252,11 +288,11 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         if (r.get('prediction') or {}).get('invalid_reason'):details.append('INVALID reason: '+r['prediction']['invalid_reason'])
         rows=[list(item.split(': ',1)) if ': ' in item else ['Evidence',item] for item in details]
         y=audit_table(['Evidence / field','Recorded value'],rows,[160,W-216],y,jid+' | Evidence Details')
-        for key in ('rubbing_clip','acid_clip','acid_candidate_clip'):
+        for key in (('rubbing_clip','acid_clip') if simple_output else ('rubbing_clip','acid_clip','acid_candidate_clip')):
             clip=r.get(key) or {}
             if y>H-75:footer();header(jid+' | Evidence Links','Original saved video');y=130
             link(key.replace('_',' ').title(),clip.get('path'),28,y);y+=20
-        link('Per-cycle JSON manifest',r.get('record_path'),28,min(y,H-55))
+        if not simple_output:link('Per-cycle JSON manifest',r.get('record_path'),28,min(y,H-55))
         footer()
     if recording_problems:
         header('Recording Exceptions','Capture failures remain separate from model predictions')

@@ -26,9 +26,10 @@ class RetentionPolicy:
     retain_frame_catalogue: bool=False
     bank_min_retention_days: int=0
     original_min_retention_days: int=0
+    simple_output: bool=False
 
     def __post_init__(self):
-        for name in ('enabled','cleanup_raw_after_archive','require_server_ack','retain_frame_catalogue'):
+        for name in ('enabled','cleanup_raw_after_archive','require_server_ack','retain_frame_catalogue','simple_output'):
             if type(getattr(self,name)) is not bool:raise ValueError('Retention flags must be JSON booleans')
         for name in ('idle_buffer_seconds','pre_roll_seconds','disk_warning_free_gib','h264_crf','encoder_threads','archive_retention_days','target_test_bytes','archive_min_long_edge','archive_min_ssim','bank_min_retention_days','original_min_retention_days'):
             value=getattr(self,name)

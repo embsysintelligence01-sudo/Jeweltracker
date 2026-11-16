@@ -1,12 +1,13 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
 import numpy as np
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtWidgets, QtTest
 
 import jewel_tracker_5 as app
 
@@ -30,6 +31,56 @@ class ContinuousUITests(unittest.TestCase):
                        self.window.btn_stone_ready, self.window.btn_cancel_acid):
             self.assertFalse(widget.isVisible())
         self.assertTrue(self.window.btn_test.isVisible())
+
+    def test_storage_progress_remains_visible_during_live_test_updates(self):
+        self.window.continuous_update(dict(kind='storage', status='FAILED',
+                                          message='Compression will retry; originals retained.'))
+        self.window.continuous_update(dict(kind='status', message='Recording the next jewel.'))
+        self.assertIn('Compression will retry', self.window.storage_label.text())
+        self.assertIn('Recording the next jewel', self.window.acid_instruction.text())
+
+    def test_reset_keeps_event_loop_alive_until_session_finishes(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowSession(app.Worker):
+            def run(self):
+                entered.set()
+                release.wait(5)
+
+        worker = SlowSession(0, [], continuous=True)
+        self.window.worker = worker
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            with patch.object(self.window, 'toggle_connect') as reconnect, \
+                    patch.object(worker, 'stop', wraps=worker.stop) as stop:
+                self.window.rearm()
+                self.window.rearm()  # Repeated clicks cannot restart twice.
+                heartbeat = []
+                QtCore.QTimer.singleShot(0, lambda: heartbeat.append(True))
+                QtTest.QTest.qWait(150)
+                self.assertEqual([True], heartbeat)
+                self.assertTrue(worker.isRunning())
+                self.assertIs(worker, self.window.worker)
+                self.assertFalse(self.window.btn_reset.isEnabled())
+                reconnect.assert_not_called()
+                stop.assert_called_once()
+                # Closing during Reset must retain the running native worker.
+                self.assertFalse(self.window.close())
+                self.assertIs(worker, self.window.worker)
+                release.set()
+                self.assertTrue(worker.wait(1000))
+                QtTest.QTest.qWait(150)
+                reconnect.assert_called_once()
+                self.assertIsNone(self.window.worker)
+                self.assertFalse(self.window.reset_timer.isActive())
+                self.assertTrue(self.window.btn_conn.isEnabled())
+                self.assertTrue(self.window.cam_mode.isEnabled())
+        finally:
+            release.set()
+            worker.wait(1000)
+            self.window.reset_timer.stop()
+            self.window.worker = None
 
     def test_missing_mask_note_does_not_replace_acid_result_in_table(self):
         record = dict(prediction=dict(prediction='non_gold', confidence=.94),

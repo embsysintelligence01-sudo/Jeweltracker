@@ -149,7 +149,7 @@ class EvidenceRetentionTests(unittest.TestCase):
     def test_checksum_mismatch_after_ack_never_cleans_raw(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);self.fixture(root)
-            with patch('evidence_archive.encoder_available',return_value=None):ArchiveManager(root).finalize(quiescent=True)
+            with patch('evidence_archive.encoder_available',return_value=None):ArchiveManager(root,RetentionPolicy()).finalize(quiescent=True)
             target=next((root/'archives').glob('*/videos/*'));target.write_bytes(b'corrupt')
             with self.assertRaises(OSError):ArchiveManager(root,RetentionPolicy(require_server_ack=False)).finalize(quiescent=True)
             self.assertTrue((root/'frames').exists())

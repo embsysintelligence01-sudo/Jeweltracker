@@ -66,7 +66,7 @@ class HistoricalCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);self.fixture(root)
             with patch('evidence_archive.encoder_available',return_value=None):
-                result=ArchiveManager(root).finalize(True)
+                result=ArchiveManager(root,RetentionPolicy()).finalize(True)
             self.assertEqual('awaiting_server_ack',result['status']);self.assertTrue((root/'frames').exists())
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);self.fixture(root)

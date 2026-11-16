@@ -129,6 +129,15 @@ class CaptureTests(unittest.TestCase):
         self.assertGreater(len(seq.observation_frames),1)
         self.assertEqual(seq.baseline_frames[0].shape,seq.observation_frames[0].shape)
 
+    def test_trial_detector_confidence_boundary(self):
+        for confidence, expected in ((.29, 'WAIT_FOR_ACID'), (.30, 'OBSERVING'), (.59, 'OBSERVING')):
+            with self.subTest(confidence=confidence):
+                seq = self.prepare()
+                for t in (2.2, 2.4, 2.6):
+                    seq.push(FRAME, t)
+                    seq.accept_detections([Detection(BOX, confidence)], t)
+                self.assertEqual(expected, seq.state)
+
     def test_miss_resets_confirmation(self):
         seq=self.prepare()
         seq.accept_detections([Detection(BOX,.9)],2.2)
@@ -444,7 +453,7 @@ class ThreadFlowTests(unittest.TestCase):
                      stone=STONE,streak=STREAK,grabber=grabber,
                      stone_getter=lambda:None if stone_lost[0] else stone_getter(),
                      ph_verification_enabled=ph_enabled, auto_test=auto)
-        detector=Mock();detector.predict.return_value=([Detection(BOX,.95)],1.0)
+        detector=Mock(model_sha256='a'*64);detector.predict.return_value=([Detection(BOX,.95)],1.0)
         classifier=Mock();classifier.predict.return_value=record()['prediction']
         events,completed,failed=[],[],[]
         thread=AcidTestThread(context,.12)

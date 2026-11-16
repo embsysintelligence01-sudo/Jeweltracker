@@ -227,6 +227,10 @@ def write_report(directory, jewels, tests, recording_problems=()):
     """Only actual tracker outputs: IDs, pictures, tracking, rub/mask and acid."""
     from evidence_archive import report_guard
     with report_guard(directory):
+        # A completed simple session contains only the PDF and final clips.
+        # A stale report job must not recreate JSON/raw-image references.
+        if (Path(directory)/'report.pdf').is_file() and not (Path(directory)/'session.json').exists():
+            return str(Path(directory)/'report.pdf')
         if (Path(directory)/'archive_commit.json').is_file():
             from evidence_archive import ArchiveManager
             ArchiveManager(directory).validate_commit()
@@ -237,10 +241,13 @@ def write_report(directory, jewels, tests, recording_problems=()):
 def _write_report(directory,jewels,tests,recording_problems=()):
     from audit_report import render_report
     directory=Path(directory)
+    from live_retention import compact_records
+    tests=compact_records(directory,tests)
     manifest=dict(schema='jewel_continuous_session_v1',generated=datetime.now().isoformat(),
                   jewels=jewels,tests=tests,recording_problems=list(recording_problems))
     atomic_json(directory/'session.json',manifest)
     temp=directory/'report.tmp.pdf'
-    render_report(temp,directory,jewels,tests,recording_problems,prediction_text)
+    render_report(temp,directory,jewels,tests,recording_problems,prediction_text,
+                  simple_output=any(r.get('compact_report') for r in tests))
     os.replace(temp,directory/'report.pdf')
     return str(directory/'report.pdf')

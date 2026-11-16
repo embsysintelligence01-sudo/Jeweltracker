@@ -15,11 +15,16 @@ models. Jewel Tracker needs no imports or model files from `puritytesting`.
 - `onnx_detector.py`, `analyzer.py`, `analyzer_v2.py`, `storage.py`, `flow.py`:
   copied detection, analysis, storage and geometry helpers.
 - `models/acid_detector.onnx`: copy of `acidbestmodel_hailo_ready.onnx`.
-- `model_training/artifacts/temporal_shared_mobilenet_v3_small_20261021_144911.onnx`:
-  the active classifier trained on 21 October 2026 and copied from the lab.
+  The integrated tracker uses this detector through ONNX Runtime CPU. The
+  experimental INT8 acid detector is disabled and its weights are archived
+  under `../../backups/disabled_acid_int8_20261102/`.
+- `model_training/artifacts/temporal_shared_mobilenet_v3_small_20261102_160901.onnx`:
+  the active classifier trained on 2 November 2026 and copied from the lab.
+  It used 150 complete training sequences (31 gold, 96 non-gold, 23 invalid),
+  containing 15,931 source frames, and 14 separate validation sequences.
   Its PyTorch checkpoint, report, split, and dataset index are included.
-  The previous `temporal_mobilenet_v3_20260912_170149.onnx` and companion
-  artifacts remain available for rollback.
+  The previous October and September classifiers and companion artifacts
+  remain available for rollback.
 - `model_training/`: copied architecture, dataset preparation and training
   code for future development. The original lab's dataset is not copied.
 
@@ -40,16 +45,16 @@ spinning disabled. Restart the tracker to load newly replaced/retrained models.
 
 The tracker selects the newest supported ONNX artifact by modification time;
 copying today's artifact preserved its training timestamp. Its SHA-256 is
-`868d1d8d1bfcae2f9c2a675df0b4161eba7c93a20119ed9868a81d104989b473`.
+`dd2cd6279355ef9c17652e7a5c0f37373c32e12b5091f4455d0bd362d500a37b`.
 The three classes remain `gold_22k`, `non_gold`, and `invalid`, in that order.
 Preprocessing, gold/general confidence thresholds (0.85/0.65), the acid
 detector, observation timing, camera controls, and jewel/rubbing logic were
 not changed for this update. The existing runtime already supports this
 shared MobileNet architecture, so no Python source changes were required.
 
-Deployment verification compares the lab's inference methods and the actual
-tracker model cache on all 14 recorded validation sequences. See
-[`../diagnostics/acid_model_update_20261021/verification.json`](../diagnostics/acid_model_update_20261021/verification.json)
+Deployment verification runs the tracker runtime on all 14 recorded validation
+sequences and checks the actual model cache selection and copied file hashes. See
+[`../diagnostics/acid_model_update_20261102/verification.json`](../diagnostics/acid_model_update_20261102/verification.json)
 for per-sequence results and model selection checks. This checks integration
 and prediction parity; it is not an independent accuracy or physical acid
 test. The training report marks this model as a development candidate.
