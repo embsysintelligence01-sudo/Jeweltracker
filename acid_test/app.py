@@ -44,7 +44,7 @@ if str(PURITY_ROOT) not in sys.path:
     sys.path.insert(0, str(PURITY_ROOT))
 
 from acid_test.flow import bbox_iou, pad_bbox  # noqa: E402
-from acid_test.onnx_detector import OnnxAcidDetector  # noqa: E402
+from acid_test.onnx_detector import OnnxAcidDetector, ACID_DETECTION_CONFIDENCE  # noqa: E402
 
 from acid_test.analyzer import median_frame  # noqa: E402
 from acid_test.analyzer_v2 import analyze_sequence_v2  # noqa: E402
@@ -72,7 +72,7 @@ CAPTURE_FPS = 5.0
 TRANSITION_CAPTURE_FPS = 15.0
 TRANSITION_BUFFER_SECONDS = 15.0
 TRANSITION_JPEG_QUALITY = 95
-DETECTION_CONFIDENCE = 0.30
+DETECTION_CONFIDENCE = ACID_DETECTION_CONFIDENCE
 DETECTION_CONFIRMATIONS = 3
 DETECTION_IOU = 0.45
 REACTION_PADDING = 0.45

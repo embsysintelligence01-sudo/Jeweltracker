@@ -28,7 +28,7 @@ class FreshnessAdvisoryFlowTests(unittest.TestCase):
             np.testing.assert_array_equal(scene(),m.reference.frame)
             self.assertEqual(2,len([e for e in events if e[0]=='reference']))
 
-    def test_existing_acid_in_baseline_starts_reaction_with_advisory_warning(self):
+    def test_existing_acid_in_baseline_does_not_start_reaction(self):
         with monitor_case() as (m,events):
             image=scene(acid=True)
             m.step(snap(100,held=1,frame=image));a=m.active
@@ -36,9 +36,8 @@ class FreshnessAdvisoryFlowTests(unittest.TestCase):
                      fresh_gate=FreshAcidGate(np.full((256,256),255,np.uint8),image,QUAD))
             m._acid_observation(100.3,a['id'],[DETECTION],(image,QUAD,True,True,False))
             m._verify_application(a,image,QUAD,100.34,True,True)
-            self.assertIsNotNone(a['acid_onset'])
-            self.assertTrue(a['fresh_acid_evidence']['previous_acid_overlap_warning'])
-            self.assertEqual('ACID_CONFIRMED_FRESHNESS_ADVISORY',a['fresh_acid_status'])
+            self.assertIsNone(a['acid_onset'])
+            self.assertEqual('NO_NEW_PATCH_SINCE_BASELINE',a['application_verifier'].pending[0]['reason'])
 
     def test_weak_baseline_change_confirms_clear_patch_without_freshness_retry(self):
         faint=scene();faint[107:110,128:133]=(0,255,0)
@@ -60,7 +59,7 @@ class FreshnessAdvisoryFlowTests(unittest.TestCase):
         self.assertIsNotNone(crop.best)
         self.assertEqual(DETECTION['bbox'],crop.best['bbox'])
 
-    def test_recorded_recovery_allows_existing_patch_and_preserves_freshness_warning(self):
+    def test_recorded_recovery_rejects_unchanged_baseline_patch(self):
         with monitor_case() as (m,events):
             m.step(snap(100,held=1));a=m.active;m.detector=Detector()
             image=scene(acid=True)
@@ -70,10 +69,8 @@ class FreshnessAdvisoryFlowTests(unittest.TestCase):
             for i in range(25):m.journal.offer(image,100+i*.1)
             m.journal.queue.join()
             onset,best,_,_=m._search_recording(a,100.2,102.3)
-            self.assertIsNotNone(onset)
-            self.assertTrue(best['freshness_warning'])
-            m._set_acid(a,onset,best,recovered=True)
-            self.assertTrue(a['stop_search'].is_set())
-            self.assertTrue(any('Freshness checking is advisory' in s for s in a['issues']))
+            self.assertIsNone(onset)
+            self.assertIsNone(best)
+
 
 if __name__=='__main__':unittest.main()

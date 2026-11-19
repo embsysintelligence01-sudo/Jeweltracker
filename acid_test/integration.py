@@ -16,7 +16,7 @@ import numpy as np
 from PyQt5 import QtCore
 
 from .runtime import TemporalMobileNet, latest_temporal_model_path, DETECTOR_PATH, LAB_ROOT, _sha256
-from .onnx_detector import OnnxAcidDetector
+from .onnx_detector import OnnxAcidDetector, ACID_DETECTION_CONFIDENCE
 from .sequence import AcidSequence
 from .flow import bbox_iou
 from acidphintegration.auto_sop import (
@@ -57,7 +57,7 @@ class AcidModelCache:
                 # Synthetic warm-up only. Live inference runs during a
                 # confirmed rubbed jewel's test and its cleanup handoff.
                 blank = np.zeros((320, 320, 3), dtype=np.uint8)
-                detector.predict(blank, 0.30)
+                detector.predict(blank, ACID_DETECTION_CONFIDENCE)
                 classifier.predict([blank], [blank], [blank])
                 self.detector_sha256 = detector.model_sha256
                 self._models = detector, classifier
@@ -311,7 +311,7 @@ class AcidTestThread(QtCore.QThread):
                         now = time.monotonic()
                         future = None
                     if seq.state == 'WAIT_FOR_ACID' and future is None and now - last_detection >= 0.2:
-                        future = pool.submit(detector.predict, frame.copy(), 0.30)
+                        future = pool.submit(detector.predict, frame.copy(), ACID_DETECTION_CONFIDENCE)
                         last_detection = now
                     if seq.state != 'PROCESSING' and (seq.state != last_phase or now - last_progress >= 0.1):
                         self.progress.emit(self.payload(phase=seq.state, message=seq.instruction(now)))

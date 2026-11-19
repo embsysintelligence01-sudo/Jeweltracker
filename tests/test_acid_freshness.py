@@ -78,7 +78,7 @@ class FreshnessTests(unittest.TestCase):
         self.assertFalse(np.any(history.mask))
         self.assertEqual('VISUALLY_CLEARED',history.events[-1]['status'])
 
-    def test_live_and_export_allow_baseline_acid_with_warning(self):
+    def test_live_and_export_reject_unchanged_baseline_acid(self):
         from test_sop_revision import monitor_case,snap
         with monitor_case() as (monitor,events):
             monitor.step(snap(100,held=1));a=monitor.active
@@ -90,12 +90,11 @@ class FreshnessTests(unittest.TestCase):
             monitor.journal.queue.join()
             monitor._acid_observation(100.5,a['id'],[OLD],(scene(acid=True),QUAD,True,True,False))
             monitor._verify_application(a,scene(acid=True),QUAD,100.55,True,True)
-            self.assertIsNotNone(a['acid_onset'])
+            self.assertIsNone(a['acid_onset'])
             monitor._finish(105.6);monitor.drain_finalization()
             record=monitor.tests[0]
-            self.assertTrue(record['capture_complete'])
-            self.assertTrue(record['fresh_acid_evidence']['freshness_warning'])
-            self.assertTrue(any('Freshness checking is advisory' in s for s in record['issues']))
+            self.assertFalse(record['capture_complete'])
+            self.assertIsNone(record['acid_onset'])
 
     def test_new_acid_elsewhere_keeps_model_output_and_saves_both_locations(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,16 +27,15 @@ class EarlyAcidAuditTests(unittest.TestCase):
             m._acid_observation(101,a['id'],[DETECTION],(scene(acid=True),QUAD,True,True,False))
             self.assertEqual(100.5,a['acid_onset'])
 
-    def test_existing_baseline_patch_proceeds_with_freshness_warning(self):
+    def test_existing_baseline_patch_cannot_confirm_application(self):
         with monitor_case() as (m, events):
             m.step(snap(100,held=1));a=m.active
             a.update(returned=100.1,baseline_at=100.2,
                      fresh_gate=FreshAcidGate(np.zeros((256,256),np.uint8),scene(acid=True),QUAD))
             for ts in (100.3,100.6,101):
                 m._acid_observation(ts,a['id'],[DETECTION],(scene(acid=True),QUAD,True,True,False))
-            self.assertIsNotNone(a['acid_onset'])
-            self.assertTrue(a['fresh_acid_evidence']['freshness_warning'])
-            self.assertTrue(any('not a verified chemical application time' in note for note in a['issues']))
+            self.assertIsNone(a['acid_onset'])
+            self.assertEqual('NO_NEW_PATCH_SINCE_BASELINE', a['application_verifier'].pending[0]['reason'])
 
     def test_hand_evidence_precedes_missing_state(self):
         self.assertEqual('IN_HAND',visibility(track(state='MISSING',in_hand=True),10,False))

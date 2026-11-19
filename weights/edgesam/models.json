@@ -1,0 +1,14 @@
+{
+  "repository": "chongzhou/EdgeSAM",
+  "revision": "32266dda3cf1d5ea1cdccd386de1eb3355d0f0b9",
+  "files": {
+    "edge_sam_3x_encoder.onnx": {
+      "sha256": "719a498cf5b3fe9be9f01ee513e13d3915f9028aa4f23dfd30eaaa0a17143159",
+      "bytes": 22098300
+    },
+    "edge_sam_3x_decoder.onnx": {
+      "sha256": "83a2174d54571596913dcb7455d021e713623c3dca30a31c8c41ab98c9fb0863",
+      "bytes": 15937006
+    }
+  }
+}

@@ -19,6 +19,8 @@ REPORT_TIMEZONE=ZoneInfo('Asia/Kolkata')
 
 
 def audit_outcome(r):
+    if r.get('sop_review_status')=='PENDING':return 'PENDING'
+    if r.get('sop_review_status')=='REVIEW_REQUIRED':return 'REVIEW REQUIRED'
     if not r.get('capture_complete') or not r.get('prediction'):return 'INCOMPLETE'
     mask_verified=r.get('mask_evidence_status')=='VERIFIED'
     if (r.get('rubbing_verified') and mask_verified and r.get('acid_target_status')=='ACID_OVERLAPS_NEW_RUB'
@@ -231,7 +233,9 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         verified_mask=r.get('mask_evidence_status')=='VERIFIED'
         panel(304,196,264,235,'02 / New rubbed-mark detection',r.get('mask_image') or r.get('candidate_mask_image'),mask_caption,
               status='VERIFIED' if verified_mask else 'NOT VERIFIED',verified=verified_mask)
+        mask_caption+=' | '+str(r.get('rub_evidence_source',r.get('evidence_source','LIVE / RECORDED MODEL')))
         acid_caption=when(r.get('acid_placement_timestamp',r.get('acid_onset')))+' | '+(target or 'Fresh application not established')
+        acid_caption+=' | '+str(r.get('acid_evidence_source',r.get('evidence_source','LIVE / RECORDED MODEL')))
         verified_acid=target=='ACID_OVERLAPS_NEW_RUB'
         panel(28,444,264,238,'03 / Acid placement',r.get('acid_rub_comparison_image') or r.get('acid_detection_image'),acid_caption,
               status='VERIFIED - OVERLAPPING' if verified_acid else acid,verified=verified_acid)
@@ -256,6 +260,10 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         if y>H-150:
             footer();header(jid+' | Evidence Details','Recorded evidence and verification');y=130
         details=[]
+        if r.get('backup'):
+            details.append('Backup verification: '+str(r['backup'].get('status'))+' | '+str(r['backup'].get('reason')))
+        if r.get('performance_timings'):details.append('Processing seconds and counts: '+str(r['performance_timings']))
+        if r.get('sop_review_status'):details.append('SOP evidence status: '+r['sop_review_status'])
         for key in ('cycle_id','revision','alignment_mode','rubbed_model','rubbed_region_kind','before_status','ph_status','close_reason','contact_close_reason','reaction_coverage_status','rubbing_status','rubbing_contact_status','rubbing_contact_reason','mask_evidence_status','mask_reason','acid_status','fresh_acid_status','acid_target_status','application_verification','application_timing_status','clear_patch_frames'):
             if r.get(key) is not None:details.append(key.replace('_',' ').capitalize()+': '+str(r[key]))
         for key in ('before_timestamp','started','rubbing_started_at','rubbing_trigger_confirmed_at','rub_timestamp','returned','contact_closed_at','mask_timestamp','candidate_mask_timestamp','mask_completed_at','mask_decision_at','baseline_at','first_acid_candidate_at','application_candidate_at','application_verified_at','acid_onset','acid_placement_timestamp','finished'):
@@ -265,7 +273,9 @@ def render_report(path,directory,jewels,tests,recording_problems,prediction_text
         if r.get('acid_area_status'):details.append('Acid area: '+r['acid_area_status']+'; model-supported visual estimate, not a chemical boundary.')
         if r.get('acid_detector_model'):
             details.append('Acid detector: '+r['acid_detector_model']+' | '+str(r.get('acid_detector_backend')))
-        if r.get('rub_display_kind'):
+        if r.get('rub_display_kind')=='EDGESAM_SEGMENTATION':
+            details.append('Rubbed-mark display: EdgeSAM backup pixel segmentation with recorded persistence and contact support.')
+        elif r.get('rub_display_kind'):
             details.append('Rubbed-mark display: detection rectangle, not pixel segmentation. Before/after and persistence checks are recorded separately.')
         if r.get('previous_acid_state'):
             state=r['previous_acid_state']

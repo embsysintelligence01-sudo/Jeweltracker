@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from .flow import bbox_iou, pad_bbox
+from .onnx_detector import ACID_DETECTION_CONFIDENCE
 
 
 class AcidSequence:
@@ -76,7 +77,7 @@ class AcidSequence:
         for det in detections:
             x1, y1, x2, y2 = det.bbox
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            if det.confidence >= 0.30 and sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
+            if det.confidence >= ACID_DETECTION_CONFIDENCE and sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
                 if self.streak_mask is not None:
                     h, w = self.streak_mask.shape
                     ix1, iy1 = int(np.clip(x1, 0, w)), int(np.clip(y1, 0, h))

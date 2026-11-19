@@ -1,0 +1,4 @@
+# Run inside the existing SLIC environment after the normal project setup.
+# Reuse its NumPy and OpenCV/contrib; do not replace the live OpenCV build.
+# No EdgeSAM PyTorch package or retraining is required.
+onnxruntime>=1.17,<2

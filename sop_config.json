@@ -2,5 +2,23 @@
   "acid_inactivity_seconds": 12.0,
   "next_pickup_debounce_seconds": 0.3,
   "max_recovery_acid_frames": 60,
-  "max_recovery_contact_frames": 24
+  "max_recovery_contact_frames": 24,
+  "edgesam_backup": {
+    "enabled": true,
+    "encoder": "weights/edgesam/edge_sam_3x_encoder.onnx",
+    "decoder": "weights/edgesam/edge_sam_3x_decoder.onnx",
+    "threads": 1,
+    "nice": 15,
+    "max_cpus": 1,
+    "timeout_seconds": 45,
+    "max_queue_seconds": 120,
+    "initial_frames": 4,
+    "max_frames": 16,
+    "contact_frames": 12,
+    "box_padding": 0.2,
+    "min_score": 0.85,
+    "min_sharpness": 8,
+    "max_pose_age": 0.4,
+    "embedding_cache_size": 4
+  }
 }

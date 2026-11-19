@@ -26,6 +26,7 @@ from rub_preparation import clear_surface, draw_acid_roi
 from session_evidence import FrameJournal, atomic_json, write_report
 from acid_freshness import AcidHistory, FreshAcidGate, footprint, normalized, DEST as ACID_DEST
 from acid_application import AcidApplicationVerifier
+from acid_test.onnx_detector import ACID_DETECTION_CONFIDENCE, ACID_STONE_PADDING
 from acid_area import AcidAreaMeasurement, region_box, compare_area
 from acid_test.flow import pad_bbox
 from classification_crop import ClassificationCrop, extract_crop
@@ -48,6 +49,11 @@ PHASE_TITLES = {
     'PROCESSING': 'PROCESSING ACID RESULT', 'DONE': 'DONE',
     'INCOMPLETE':'FINALIZED / INCOMPLETE EVIDENCE',
 }
+
+
+def surface_ready_at(attempt):
+    """A clear post-rub stone can arm capture without claiming jewel return."""
+    return attempt.get('surface_ready_at') if attempt.get('surface_ready_at') is not None else attempt.get('returned')
 
 
 def workflow_lines(state, completed=()):
@@ -329,6 +335,9 @@ class ContinuousMonitor(threading.Thread):
         self.inactivity_seconds=max(.1,float(config['acid_inactivity_seconds'] if inactivity_seconds is None else inactivity_seconds))
         self.pickup_debounce=max(0.,float(config['next_pickup_debounce_seconds'] if pickup_debounce is None else pickup_debounce))
         self.recovery_acid_frames=max(1,int(config['max_recovery_acid_frames']))
+        from backup_recovery import configuration
+        self.backup_config=configuration(config.get('edgesam_backup'))
+        self.backup_worker=None
         self.recovery_contact_frames=max(1,int(config['max_recovery_contact_frames']))
         self.next_pickup=None
         self.clear_history=deque(maxlen=8)
@@ -408,6 +417,7 @@ class ContinuousMonitor(threading.Thread):
             self.journal.close()
             self.drain_finalization()
             self.finish_pool.shutdown(wait=True)
+            if self.backup_worker is not None:self.backup_worker.close()
             self.report_pool.shutdown(wait=True)
             self._close_intervals(self.last_ts)
             if self.storage_worker is not None:
@@ -571,7 +581,7 @@ class ContinuousMonitor(threading.Thread):
             return
         self._close_contact(a, ts, 'BASELINE_STARTED')
         a['baseline_at'] = a['mask_decision_at'] = ts
-        a['recovery_cursor'] = a['returned']
+        a['recovery_cursor'] = surface_ready_at(a)
         a['fresh_gate'] = FreshAcidGate(self.acid_history.mask,
             a['return_frame'] if a.get('return_frame') is not None else frame, self.pose.quad)
         a['application_verifier'] = None
@@ -768,7 +778,7 @@ class ContinuousMonitor(threading.Thread):
             a['baseline_acid_detections'] = found
             a['acid_baseline_checked'] = True
             return
-        idle_sample = a is None or observed < (a.get('returned') or float('inf'))
+        idle_sample = a is None or observed < (surface_ready_at(a) or float('inf'))
         if idle_sample:
             if a is None or observed < a['started']:
                 self.acid_history.observe_idle(frame, quad, found, observed, clear)
@@ -867,7 +877,7 @@ class ContinuousMonitor(threading.Thread):
 
     def _confirm_candidate(self, a, frame, ts):
         candidate = a.get('mask_candidate')
-        if candidate is None or a['mask'] is not None or a['returned'] is None or a['acid_onset'] is not None:
+        if candidate is None or a['mask'] is not None or surface_ready_at(a) is None or a['acid_onset'] is not None:
             return
         state,reason=validate_mark(candidate,frame,self.pose.quad,ts,a.get('contact_region'),self.placement)
         a['mask_evidence_status'],a['mask_reason']=state,reason
@@ -983,20 +993,19 @@ class ContinuousMonitor(threading.Thread):
         if cancelled is not None and cancelled.is_set():return ts,cycle_id,[]
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = stone
-        pad = .12*max(x2-x1, y2-y1)
+        pad = ACID_STONE_PADDING*max(x2-x1, y2-y1)
         x1, y1 = max(0, int(x1-pad)), max(0, int(y1-pad))
         x2, y2 = min(w, int(x2+pad)), min(h, int(y2+pad))
         if x2 <= x1 or y2 <= y1:
             return ts, cycle_id, []
         with self.detector_lock:
             if cancelled is not None and cancelled.is_set():return ts,cycle_id,[]
-            # Match the reference temporal lab's detector input scale. Boxes
-            # are already camera coordinates; never add the stone origin.
-            dets, _ = self.detector.predict(frame, .60)
+            # Enlarge the stone for the detector, then restore camera coordinates.
+            dets, _ = self.detector.predict(frame[y1:y2, x1:x2], ACID_DETECTION_CONFIDENCE)
         if cancelled is not None and cancelled.is_set():return ts,cycle_id,[]
         found = []
         for det in dets:
-            box = tuple(int(v) for v in det.bbox)
+            box = tuple(int(v) + (x1 if i % 2 == 0 else y1) for i, v in enumerate(det.bbox))
             cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
             if stone[0] <= cx <= stone[2] and stone[1] <= cy <= stone[3]:
                 found.append(dict(bbox=box, confidence=det.confidence))
@@ -1198,18 +1207,33 @@ class ContinuousMonitor(threading.Thread):
                 a['return_detected'] = a.get('return_detected', ts)
                 if self.pose.stable_since is None or ts-self.pose.stable_since < .10:
                     return
-                a['returned'], a['return_frame'] = a['return_detected'], frame
+                a['returned'] = a['return_detected']
                 self._close_contact(a,ts,'JEWEL_RETURNED')
-                a['return_frame_timestamp']=ts
-                a['decision_deadline'] = a['returned']+1.
+                if a.get('surface_ready_at') is None:
+                    a['return_frame'], a['return_frame_timestamp'] = frame, ts
+                    a['decision_deadline'] = a['returned']+1.
+                a['return_status'] = 'VERIFIED_RETURN'
                 self._phase('MASK_CHECK', 'Jewel returned and stone inside ROI; checking the new rubbed mask.', a)
-            if a['returned'] is not None:
+            # Require observed rubbing, an empty stable stone and a settling
+            # interval. Do not fabricate a jewel-return event when tracking fails.
+            if (contact_armed and a['returned'] is None and surface_ready_at(a) is None
+                    and a['live_rub'] and clear and not occupied
+                    and ts-a.get('last_rub', ts) >= .6
+                    and self.pose.stable_since is not None and ts-self.pose.stable_since >= .1
+                    and inside_roi(self.pose.quad, self.placement)):
+                a['surface_ready_at'] = ts
+                a['return_frame'], a['return_frame_timestamp'] = frame, ts
+                a['decision_deadline'] = ts+1.
+                a['return_status'] = 'UNVERIFIED_CLEAR_STONE_AFTER_RUB'
+                a['issues'].append('Stone cleared after rubbing; jewel return was not verified when acid capture was armed.')
+                self._close_contact(a,ts,'CLEAR_STONE_AFTER_RUB')
+            if surface_ready_at(a) is not None:
                 if clear and not occupied and not application_pending:
                     self._confirm_candidate(a, frame, ts)
                 if a['reference'] is None:
                     a['mask_reason'] = 'No clear pre-rubbing reference was available.'
                 if a.get('baseline_at') is None:
-                    if a['mask'] is not None or a.get('mask_attempt_at', -1e9) >= a['returned'] or ts >= a['decision_deadline']:
+                    if a['mask'] is not None or a.get('mask_attempt_at', -1e9) >= surface_ready_at(a) or ts >= a['decision_deadline']:
                         self._baseline(a, frame, ts)
                     else:
                         self._phase('MASK_CHECK', 'New rubbed mask: checking. Baseline begins after this check.', a)
@@ -1300,7 +1324,7 @@ class ContinuousMonitor(threading.Thread):
             source, source_ts = frame, ts
             if baseline_sample:
                 source = a['return_frame']
-                source_ts = a.get('return_frame_timestamp',a['returned'])
+                source_ts = a.get('return_frame_timestamp',surface_ready_at(a))
                 quad = self._quad_at(a, source_ts)
             self.acid_context = (source, quad, clear and self.pose.stable_since is not None
                                  and ts-self.pose.stable_since >= .1,
@@ -1368,6 +1392,11 @@ class ContinuousMonitor(threading.Thread):
         return min(poses, key=lambda p: abs(p[0]-ts))[1] if poses else None
 
     def _queue_finalization(self,a):
+        a['backup_queued_at']=time.monotonic()
+        a['performance_timings']={}
+        if self.backup_config['enabled']:
+            a['backup_status']='PENDING'
+            self.emit('backup_pending',jewel_id=a['jewel_id'],token=a['id'],status='PENDING')
         # At most two finalization snapshots retain camera-sized arrays in RAM.
         # Overload goes to a durable local spool, never an unbounded model queue.
         with self.final_lock:
@@ -1417,10 +1446,13 @@ class ContinuousMonitor(threading.Thread):
 
     def _recover_and_save(self, a):
         try:
+            if self.backup_config['enabled']:
+                atomic_json(a['directory']/'backup_status.json',dict(status='PENDING',cycle_id=a['id']))
             self._save(a)
         except Exception as exc:
             # Preserve a visible terminal record even if a model/file operation failed.
             a['issues'].append('Recovery/save error: '+str(exc))
+            a['backup']=dict(status='REVIEW_REQUIRED',reason=str(exc))
             record = a.get('saved_record') or self._record(a)
             self._commit(record)
 
@@ -1430,7 +1462,7 @@ class ContinuousMonitor(threading.Thread):
                 'baseline_at', 'mask_decision_at', 'baseline_start_image', 'phase_events', 'acid_checks',
                 'fresh_acid_status', 'fresh_acid_evidence', 'baseline_acid_detections', 'acid_jewel_association',
                 'close_reason','mask_evidence_status','pickup_image_timestamp','reaction_end','coverage_since','reaction_interrupted_at','confirmed_classification_region','overlap_trigger_required','rubbing_started_at','rubbing_trigger_confirmed_at')
-        keys += ('application_candidate_at','application_verified_at','application_timing_status',
+        keys += ('surface_ready_at','return_status','application_candidate_at','application_verified_at','application_timing_status',
                  'application_verification','clear_patch_frames','acid_candidate_events',
                  'contact_closed_at','contact_close_reason','previous_acid_state','residue_warning','acid_search_stopped_at')
         record = {key: a.get(key) for key in keys}
@@ -1439,6 +1471,17 @@ class ContinuousMonitor(threading.Thread):
                       actual_label=None, schema='jewel_continuous_prediction_v1',
                       alignment_mode='tracked_corners_limited_motion_assumption',
                       decision_deadline=a.get('decision_deadline'), mask_completed_at=a.get('mask_completed_at'))
+        record['backup']=copy.deepcopy(a.get('backup'))
+        record['performance_timings']=a.setdefault('performance_timings',{})
+        record['evidence_source']=a.get('evidence_source','LIVE_OR_EXISTING_RECOVERY')
+        backup=a.get('backup') or {}
+        record['rub_evidence_source']=backup.get('rub',{}).get('source',
+            'RECORDED_MODEL_RECOVERY' if a.get('mask_status')=='RECOVERED_FROM_CLIP' else 'LIVE_DETECTION' if a.get('mask') is not None else 'UNVERIFIED')
+        record['acid_evidence_source']=backup.get('acid',{}).get('source',
+            'RECORDED_MODEL_RECOVERY' if a.get('acid_recovered') else 'LIVE_DETECTION' if a.get('acid_onset') is not None else 'UNVERIFIED')
+        record['acid_detector_input'] = 'PADDED_STONE_CROP'
+        record['acid_detection_confidence'] = ACID_DETECTION_CONFIDENCE
+        record['acid_stone_padding'] = ACID_STONE_PADDING
         record['rubbed_region_kind'] = vars(self.models).get('mark_evidence_kind',
             getattr(type(self.models), 'mark_evidence_kind', 'SEGMENTATION'))
         if self.detector is not None and isinstance(getattr(self.detector,'path',None),Path):
@@ -1519,14 +1562,16 @@ class ContinuousMonitor(threading.Thread):
     def _save(self, a):
         # Allow the independent recorder to persist the newest queued evidence.
         self.journal.flush_through(a['finished'])
+        a.setdefault('performance_timings',{})
+        recovery_started=time.perf_counter()
         start, end = a['started'], a['finished']
-        if (a['acid_onset'] is None and a['returned'] is not None and self.detector is not None
+        if (a['acid_onset'] is None and surface_ready_at(a) is not None and self.detector is not None
                 and a.get('fresh_gate') is not None and not self._acid_cancelled(a['id'])
                 and a.get('close_reason')!='NEXT_JEWEL_PICKUP'):
             if not a.get('acid_baseline_checked'):
-                quad = self._quad_at(a, a['returned'])
+                quad = self._quad_at(a, surface_ready_at(a))
                 if quad is not None and a.get('return_frame') is not None:
-                    _, _, baseline_found = self._detect(a['return_frame'], a['returned'], box_of(quad), a['id'])
+                    _, _, baseline_found = self._detect(a['return_frame'], surface_ready_at(a), box_of(quad), a['id'])
                     # Match live handling: baseline boxes are observations only.
                     a['baseline_acid_detections'] = baseline_found
                     a['acid_baseline_checked'] = True
@@ -1534,7 +1579,7 @@ class ContinuousMonitor(threading.Thread):
             # The active search is cancelled at stop; this bounded export uses
             # its own cancellation token and uses the same detector/clear-patch checks as live capture.
             recovery['stop_search'] = threading.Event()
-            observed, best, _, rejected = self._search_recording(recovery, a['returned'], end)
+            observed, best, _, rejected = self._search_recording(recovery, surface_ready_at(a), end)
             a['fresh_gate'].rejections.extend(rejected)
             if best is not None and not self._acid_cancelled(a['id']):
                 a['acid_onset'], a['detector_bbox'] = observed, best['bbox']
@@ -1550,6 +1595,8 @@ class ContinuousMonitor(threading.Thread):
                 a['fresh_acid_evidence'] = {key: best.get(key) for key in ('freshness', 'fresh_changed_fraction',
                     'application_verification','clear_patch_frames')}
                 self._note_previous_acid_overlap(a,best)
+        a['performance_timings']['acid_verification_seconds']=time.perf_counter()-recovery_started
+        rubbing_started=time.perf_counter()
         onset = a['acid_onset']
         mask_cutoff = a.get('application_candidate_at')
         if mask_cutoff is None:
@@ -1615,6 +1662,19 @@ class ContinuousMonitor(threading.Thread):
             else:
                 a['mask_evidence_status']='NOT_ESTABLISHED'
                 a['mask_reason']='Insufficient independent clear frames before acid/session end.'
+        a['performance_timings']['rubbing_verification_seconds']=time.perf_counter()-rubbing_started
+        a['performance_timings']['existing_recovery_seconds']=time.perf_counter()-recovery_started
+        # Additional analysis owns independent models in a low-priority process.
+        # It sees this finished cycle only, and never changes the active cycle.
+        if self.backup_config['enabled']:
+            if a.get('acid_onset') is not None:
+                self._recover_acid_area(a,a['acid_onset'],min(end,a['acid_onset']+5))
+            from backup_recovery import recover
+            try:
+                recover(self,a,contact)
+            except Exception as exc:
+                a['backup']=dict(status='REVIEW_REQUIRED',reason=str(exc))
+            onset=a['acid_onset']
         record = self._record(a)
         a['saved_record'] = record
         if a['reference'] is not None:
@@ -1680,7 +1740,7 @@ class ContinuousMonitor(threading.Thread):
             record['classification_roi_checks']=crop_check.checks
             record['classification_advisory_status']=('DETECTOR_PAIR_OBSERVED' if crop_check.best else
                 'SEARCH_CANCELLED_AFTER_NEXT_PICKUP' if self._acid_cancelled(a['id']) else 'NO_ADDITIONAL_PAIR_OBTAINED')
-            record['classification_detector_input']='FULL_CAMERA_FRAME'
+            record['classification_detector_input']=('RECORDED_VERIFIED_REGION' if a.get('backup',{}).get('acid') else 'FULL_CAMERA_FRAME')
             source_quad=a.get('acid_source_quad')
             if source_quad is None:source_quad=onset_quad
             if verified_crop:
@@ -1800,9 +1860,15 @@ class ContinuousMonitor(threading.Thread):
                     rub_mask = project_mask(a['mask'].get('display_mask_reference',a['mask']['new_mask']), comparison.shape,
                         cv2.getPerspectiveTransform(current_quad.astype(np.float32), DEST))
                     draw_acid_roi(comparison,rub_mask)
+                if measured and a.get('backup',{}).get('acid'):
+                    acid_pixels=project_mask(area.mask,comparison.shape,
+                        cv2.getPerspectiveTransform(np.asarray(placement_quad,np.float32),ACID_DEST))>0
+                    contours,_=cv2.findContours(acid_pixels.astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(comparison,contours,-1,(0,255,255),2)
+                    record['acid_visual_overlay']='BACKUP_VERIFIED_REGION_YELLOW_OUTLINE'
                 crop = self._stone_picture(comparison, placement_quad)
                 legend = np.full((75, max(500, crop.shape[1]), 3), 245, np.uint8)
-                cv2.putText(legend, 'MAGENTA: new rub | ACID SOURCE: unmasked', (8,25), cv2.FONT_HERSHEY_SIMPLEX, .45, (40,40,40), 1)
+                cv2.putText(legend, ('MAGENTA: new rub | YELLOW: backup acid' if measured and a.get('backup',{}).get('acid') else 'MAGENTA: new rub | ACID SOURCE: unmasked'), (8,25), cv2.FONT_HERSHEY_SIMPLEX, .45, (40,40,40), 1)
                 cv2.putText(legend, record['acid_target_status'], (8,53), cv2.FONT_HERSHEY_SIMPLEX, .5, (40,40,40), 1)
                 canvas = np.full((crop.shape[0]+75, legend.shape[1], 3), 245, np.uint8)
                 canvas[:crop.shape[0], :crop.shape[1]] = crop
@@ -1825,7 +1891,9 @@ class ContinuousMonitor(threading.Thread):
                     except Exception as exc:
                         record['classifier_input_archive_error']=str(exc)
                         a['issues'].append('Exact classifier-input archive failed; raw evidence retained: '+str(exc))
+                classification_started=time.perf_counter()
                 record['prediction'] = self.classifier.predict(baseline, transition, observation)
+                record['performance_timings']['classification_seconds']=time.perf_counter()-classification_started
             else:
                 a['issues'].append('Acid model not run: a complete usable reaction, baseline/application frames, or model were unavailable.')
             for folder, images in [('baseline', baseline), ('application', transition), ('reaction', observation)]:
@@ -1884,6 +1952,24 @@ class ContinuousMonitor(threading.Thread):
         self._commit(record)
 
     def _commit(self, record):
+        if self.backup_config['enabled']:
+            backup=record.get('backup') or {}
+            verified=(record.get('rubbing_verified') and record.get('mask_evidence_status')=='VERIFIED'
+                and record.get('acid_onset') is not None and record.get('acid_area_bbox')
+                and record.get('prediction') and record.get('reaction_coverage_status')=='COMPLETE'
+                and record.get('acid_target_status')=='ACID_OVERLAPS_NEW_RUB')
+            record['sop_review_status']='VERIFIED' if verified and not backup.get('timed_out') else 'REVIEW_REQUIRED'
+            if backup.get('status')=='REVIEW_REQUIRED':record['sop_review_status']='REVIEW_REQUIRED'
+            timings=record.setdefault('performance_timings',{})
+            for stage in ('video_decoding_seconds','edgesam_inference_seconds','rubbing_verification_seconds','acid_verification_seconds','classification_seconds'):
+                timings.setdefault(stage,0.)
+            atomic_json(Path(record['record_path']).with_name('backup_status.json'),dict(
+                status=record['sop_review_status'],backup=backup,timings=timings))
+            diagnostics=Path(__file__).with_name('diagnostics')
+            diagnostics.mkdir(exist_ok=True)
+            metrics=dict(cycle_id=record.get('cycle_id'),session=str(self.directory),logged_at=time.time(),status=record['sop_review_status'],**timings)
+            for log in (self.directory/'backup_performance.jsonl',diagnostics/'backup_performance.jsonl'):
+                with log.open('a') as handle:handle.write(json.dumps(metrics)+'\n')
         try:
             atomic_json(record['record_path'], record)
             if record.get('temporal_training_capture'):

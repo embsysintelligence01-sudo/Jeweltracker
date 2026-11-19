@@ -98,11 +98,17 @@ class ApplicationVerificationTests(unittest.TestCase):
         self.assertEqual('ONSET_OBSCURED_USING_FIRST_CLEAR_PATCH',best['application_timing_status'])
         np.testing.assert_array_equal(scene(acid=True),best['source_frame'])
 
-    def test_unknown_pose_coverage_and_frame_gaps_cannot_confirm(self):
+    def test_uncertainty_flags_do_not_block_a_persistent_patch_with_coordinates(self):
         v=verifier();image=scene(acid=True)
         v.offer(image,QUAD,DETECTION,10)
-        for t in (10,10.04):self.assertIsNone(v.observe(image,QUAD,t,clear=False))
-        self.assertIsNone(v.observe(image,QUAD,10.1,geometry_known=False))
+        self.assertIsNone(v.observe(image,QUAD,10,clear=False,geometry_known=False))
+        self.assertIsNotNone(v.observe(image,QUAD,10.04,clear=False,geometry_known=False))
+
+    def test_missing_coordinates_and_frame_gaps_cannot_confirm(self):
+        v=verifier();image=scene(acid=True)
+        v.offer(image,QUAD,DETECTION,10)
+        self.assertIsNone(v.observe(image,None,10.1,geometry_known=False))
+        self.assertEqual('STONE_COORDINATES_UNAVAILABLE',v.pending[0]['reason'])
         self.assertIsNone(v.observe(image,QUAD,10.2))
         self.assertIsNone(v.observe(image,QUAD,11))
         self.assertEqual(1,v.pending[0]['count'])
@@ -136,11 +142,12 @@ class ApplicationVerificationTests(unittest.TestCase):
         self.assertTrue(best['bbox'][0]<150)  # original supported source, not the moved frame
         self.assertIsNone(verifier().observe(moved,QUAD+[20,15],10.04))
 
-    def test_baseline_patch_can_confirm_but_unrelated_patch_cannot(self):
+    def test_baseline_patch_and_unrelated_patch_cannot_confirm(self):
         v=AcidApplicationVerifier(normalized(scene(acid=True),QUAD),footprint(DETECTION['bbox'],QUAD))
         v.offer(scene(acid=True),QUAD,DETECTION,10)
         self.assertIsNone(v.observe(scene(acid=True),QUAD,10))
-        self.assertIsNotNone(v.observe(scene(acid=True),QUAD,10.04))
+        self.assertIsNone(v.observe(scene(acid=True),QUAD,10.04))
+        self.assertEqual('NO_NEW_PATCH_SINCE_BASELINE',v.pending[0]['reason'])
         v=verifier();v.offer(needle(),QUAD,DETECTION,10)
         other=scene();other[105:135,180:195]=(0,255,0)
         for t in (10.1,10.2):self.assertIsNone(v.observe(other,QUAD,t))

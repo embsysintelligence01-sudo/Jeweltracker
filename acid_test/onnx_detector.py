@@ -11,6 +11,10 @@ import numpy as np
 import onnxruntime as ort
 
 
+ACID_DETECTION_CONFIDENCE = 0.30
+ACID_STONE_PADDING = 0.12
+
+
 @dataclass
 class Detection:
     bbox: tuple[int, int, int, int]

@@ -17,15 +17,18 @@ def visible_patch(image, support):
     background = float(np.median(gray[ring])) if np.any(ring) else float(np.median(gray))
     patch = support & ((gray.astype(float)<background-8) | (hsv[:,:,1]>45))
     patch[:5]=False;patch[-5:]=False;patch[:,:5]=False;patch[:,-5:]=False
-    bright_tool = support & (gray.astype(float)>background+35) & (hsv[:,:,1]<40)
+    # Keep the whole connected applicator, including the portion outside the box.
+    bright_tool = (gray.astype(float)>background+35) & (hsv[:,:,1]<40)
     return patch, bright_tool
 
 
 class AcidApplicationVerifier:
-    def __init__(self, baseline, old_mask, window=5., max_candidates=2):
+    def __init__(self, baseline, old_mask, window=5., max_candidates=2, min_clear_frames=2):
         self.baseline = baseline.copy()
+        self.baseline_gray = cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY)
         # Historical locations must not exclude evidence of a new application.
         self.window, self.max_candidates = window, max_candidates
+        self.min_clear_frames = max(2, int(min_clear_frames))
         self.pending = []
         self.events = []
         self.last_ts = -float('inf')
@@ -80,11 +83,17 @@ class AcidApplicationVerifier:
         if timestamp <= self.last_ts or not self.pending:
             return None
         self.last_ts = timestamp
-        image = normalized(frame, quad) if quad is not None and geometry_known else None
+        # Use available stone coordinates even when the pose/clear-view
+        # heuristics are uncertain. They no longer veto acid candidates.
+        image = normalized(frame, quad) if quad is not None else None
         if image is not None:
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             skin = (hsv[:, :, 0] <= 14) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] > 80)
             light = (hsv[:, :, 1] < 40) & (hsv[:, :, 2] > 150)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            bright_delta = gray.astype(float)-self.baseline_gray.astype(float)
+            bright_delta -= np.median(bright_delta[8:-8, 8:-8])
+            new_highlights = (bright_delta > 15) & (hsv[:, :, 1] < 60)
         for candidate in list(self.pending):
             if timestamp < candidate['timestamp']:
                 continue
@@ -95,9 +104,14 @@ class AcidApplicationVerifier:
                 continue
             support = cv2.dilate(candidate['seed'].astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
             patch, tool = visible_patch(image,support) if image is not None else (None,None)
+            if image is not None:
+                tool |= new_highlights
             reason = None
-            if image is None or not clear:
-                reason = 'VISIBILITY_OR_GEOMETRY_UNCERTAIN'
+            if image is None:
+                # Coordinates are required to compare the same stone pixels.
+                reason = 'STONE_COORDINATES_UNAVAILABLE'
+            elif float(skin[8:-8, 8:-8].mean()) > .02:
+                reason = 'HAND_ON_STONE'
             elif (float(skin[support].mean()) > .2 or float(light[support].mean()) > .8):
                 reason = 'HAND_OR_GLARE_OVER_CANDIDATE'
             elif self._tool_like(tool, support):
@@ -112,6 +126,15 @@ class AcidApplicationVerifier:
                 if not np.any(patch) and timestamp - candidate['timestamp'] >= .1:
                     self._event('CANDIDATE_DISAPPEARED', timestamp, candidate)
                     self._drop(candidate)
+                continue
+            # A stable dry mark/residue already present in the baseline must
+            # not become acid merely because the cropped model detects it.
+            # Require a majority change; JPEG colour halos around an unchanged
+            # mark can otherwise pass a small changed-pixel fraction.
+            changed_patch = patch & changed_pixels(self.baseline, image)
+            if changed_patch.sum() < 5 or changed_patch.sum()/max(1, patch.sum()) < .50:
+                candidate.update(count=0, first=None, previous=None, patch=None,
+                                 reason='NO_NEW_PATCH_SINCE_BASELINE')
                 continue
             previous = candidate['previous']
             previous_ts = candidate['previous_ts']
@@ -153,7 +176,7 @@ class AcidApplicationVerifier:
             candidate.update(previous=image.copy(), previous_ts=timestamp,
                              patch=patch, reason='CHECKING_CLEAR_PATCH_PERSISTENCE')
             first = candidate['first']
-            if candidate['count'] >= 2 and timestamp-first['timestamp'] >= .03:
+            if candidate['count'] >= self.min_clear_frames and timestamp-first['timestamp'] >= .03:
                 status = ('VISIBLE_PATCH_ONSET' if first['timestamp']-candidate['timestamp'] <= .15
                           else 'ONSET_OBSCURED_USING_FIRST_CLEAR_PATCH')
                 if candidate['detection'].get('freshness_warning'):
